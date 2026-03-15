@@ -130,7 +130,7 @@ for (entry_ts, entry_px, direction), group in df.groupby(
         "Expiration": expiry,
         "Strike":     "",
         "Call/Put":   "",
-        "Commission": round(COMMISSION_PER_CONTRACT * total_qty, 4),
+        "Commission": "",
         "Fees":       "",
     })
 
@@ -150,7 +150,7 @@ for (entry_ts, entry_px, direction), group in df.groupby(
             "Expiration": expiry,
             "Strike":     "",
             "Call/Put":   "",
-            "Commission": round(COMMISSION_PER_CONTRACT * qty, 4),
+            "Commission": "",
             "Fees":       "",
         })
 

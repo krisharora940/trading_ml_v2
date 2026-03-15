@@ -150,10 +150,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
         stop_price = None
         target_price = None
         scale_out_active = False
-        scale_out_done = False
-        scale_out_first_contracts = 0
-        scale_out_second_contracts = 0
-        scale_out_second_target_r = None
+        scale_out_stage = 0   # index into scale_out_plan
+        scale_out_plan = []   # [(contracts, target_R), ...] — one entry per leg
         daily_pnl_dollars = 0.0
 
         for _, ev in events.iterrows():
@@ -235,7 +233,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         in_trade = False
                         daily_pnl_dollars += float(current.pnl) * 2.0
                         scale_out_active = False
-                        scale_out_done = False
+                        scale_out_stage = 0
                     direction = 'short'
                     candidate_active = True
                     reentry_seen = False
@@ -267,7 +265,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         in_trade = False
                         daily_pnl_dollars += float(current.pnl) * 2.0
                         scale_out_active = False
-                        scale_out_done = False
+                        scale_out_stage = 0
                     direction = 'long'
                     candidate_active = True
                     reentry_seen = False
@@ -530,6 +528,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         displacement_category = 'medium'
 
                     min_retrace = 0.45 if displacement_category == 'high' else 0.35
+                    max_retrace = 0.9 if displacement_category == 'high' else 1.2
 
                     # Require prior 1m candle to close in the direction of the trade
                     prev_1m = day_1m.loc[day_1m['timestamp'] == (t - ONE_MIN)]
@@ -542,7 +541,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         else:
                             prev_color_ok = prev_close < prev_open
 
-                    if retrace is not None and retrace >= min_retrace and retrace <= 1.2 and prev_color_ok:
+                    if retrace is not None and retrace >= min_retrace and retrace <= max_retrace and prev_color_ok:
                         if (ml_model is not None and ml_allows_entry) or (ml_model is None and (strong_count >= 2 or very_strong)):
                             entry_triggered = True
                             in_trade = True
@@ -582,23 +581,20 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 target_price = None
                                 continue
 
-                            # Scale-out rule:
-                            # - contracts >= 13 => 50% at 1.2R, remainder at 4R
-                            # - contracts < 13  => 50% at 1.2R, remainder at 2R
-                            scale_out_active = True
-                            scale_out_done = False
-                            if scale_out_active:
-                                scale_out_first_contracts = contracts // 2
-                                scale_out_second_contracts = contracts - scale_out_first_contracts
-                                if scale_out_first_contracts == 0 or scale_out_second_contracts == 0:
-                                    scale_out_active = False
-                                    scale_out_first_contracts = 0
-                                    scale_out_second_contracts = 0
-                            scale_out_second_target_r = None
+                            # Scale-out plan:
+                            #   contracts >= 13 => 25% at 1.2R, 25% at 2.5R, 25% at 4R, 25% at 6.5R
+                            #   contracts  < 13 => 25% at 1.2R, 35% at 2R,   rest at 3R
+                            scale_out_stage = 0
                             if contracts >= 13:
-                                scale_out_second_target_r = 4.0
+                                q = contracts // 4
+                                rem = contracts - 3 * q
+                                scale_out_plan = [(q, 1.2), (q, 2.5), (q, 4.0), (rem, 6.5)]
                             else:
-                                scale_out_second_target_r = 2.0
+                                q1 = contracts // 4
+                                q2 = int(contracts * 0.35)
+                                q3 = contracts - q1 - q2
+                                scale_out_plan = [(q1, 1.2), (q2, 2.0), (q3, 3.0)]
+                            scale_out_active = len(scale_out_plan) > 1 and all(q > 0 for q, _ in scale_out_plan)
                             trades.append(Trade(
                                 day=str(day),
                                 direction=direction,
@@ -674,24 +670,26 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 in_trade = False
                                 daily_pnl_dollars += float(current.pnl) * 2.0
                                 scale_out_active = False
-                                scale_out_done = False
+                                scale_out_stage = 0
                             elif high >= target_price:
-                                # Scale-out: take partial at 1.2R, keep remainder to fixed-R target
-                                if scale_out_active and not scale_out_done:
+                                if scale_out_active and scale_out_stage < len(scale_out_plan) - 1:
+                                    # Intermediate scale-out leg (long)
+                                    leg_q, _ = scale_out_plan[scale_out_stage]
+                                    next_q, next_r = scale_out_plan[scale_out_stage + 1]
                                     hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
-                                    first_exit_time = hit_time if hit_time is not None else t
-                                    first_trade = Trade(
+                                    leg_exit_time = hit_time if hit_time is not None else t
+                                    leg_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
                                         entry_time=current.entry_time,
                                         entry_price=current.entry_price,
-                                        exit_time=first_exit_time,
+                                        exit_time=leg_exit_time,
                                         exit_price=float(target_price),
-                                        pnl=float(target_price - current.entry_price) * float(scale_out_first_contracts),
-                                        contracts=scale_out_first_contracts,
-                                        risk_dollars=float(current.risk * 2.0 * scale_out_first_contracts),
+                                        pnl=float(target_price - current.entry_price) * float(leg_q),
+                                        contracts=leg_q,
+                                        risk_dollars=float(current.risk * 2.0 * leg_q),
                                         outcome='win',
-                                        exit_reason='target_scale1',
+                                        exit_reason=f'target_scale{scale_out_stage + 1}',
                                         pivot=current.pivot,
                                         flem=current.flem,
                                         flem_saved_time=current.flem_saved_time,
@@ -705,12 +703,10 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         strong_count_recent3=current.strong_count_recent3,
                                         very_strong=current.very_strong
                                     )
-                                    trades[-1] = first_trade
-                                    daily_pnl_dollars += float(first_trade.pnl) * 2.0
-
-                                    # Continue with remaining size toward fixed-R target
-                                    scale_out_done = True
-                                    target_price = current.entry_price + float(scale_out_second_target_r or 4.0) * current.risk
+                                    trades[-1] = leg_trade
+                                    daily_pnl_dollars += float(leg_trade.pnl) * 2.0
+                                    scale_out_stage += 1
+                                    target_price = current.entry_price + next_r * current.risk
                                     remaining_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
@@ -719,8 +715,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         exit_time=None,
                                         exit_price=None,
                                         pnl=None,
-                                        contracts=scale_out_second_contracts,
-                                        risk_dollars=float(current.risk * 2.0 * scale_out_second_contracts),
+                                        contracts=next_q,
+                                        risk_dollars=float(current.risk * 2.0 * next_q),
                                         outcome=None,
                                         exit_reason=None,
                                         pivot=current.pivot,
@@ -739,6 +735,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     trades.append(remaining_trade)
                                     in_trade = True
                                 else:
+                                    # Final exit (last scale-out leg or no scale-out)
                                     current.outcome = 'win'
                                     hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
                                     current.exit_time = hit_time if hit_time is not None else t
@@ -748,7 +745,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     in_trade = False
                                     daily_pnl_dollars += float(current.pnl) * 2.0
                                     scale_out_active = False
-                                    scale_out_done = False
+                                    scale_out_stage = 0
                         else:
                             # Stop is based on 1m close above pivot
                             if close >= stop_price:
@@ -762,23 +759,26 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 in_trade = False
                                 daily_pnl_dollars += float(current.pnl) * 2.0
                                 scale_out_active = False
-                                scale_out_done = False
+                                scale_out_stage = 0
                             elif low <= target_price:
-                                if scale_out_active and not scale_out_done:
+                                if scale_out_active and scale_out_stage < len(scale_out_plan) - 1:
+                                    # Intermediate scale-out leg (short)
+                                    leg_q, _ = scale_out_plan[scale_out_stage]
+                                    next_q, next_r = scale_out_plan[scale_out_stage + 1]
                                     hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
-                                    first_exit_time = hit_time if hit_time is not None else t
-                                    first_trade = Trade(
+                                    leg_exit_time = hit_time if hit_time is not None else t
+                                    leg_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
                                         entry_time=current.entry_time,
                                         entry_price=current.entry_price,
-                                        exit_time=first_exit_time,
+                                        exit_time=leg_exit_time,
                                         exit_price=float(target_price),
-                                        pnl=float(current.entry_price - target_price) * float(scale_out_first_contracts),
-                                        contracts=scale_out_first_contracts,
-                                        risk_dollars=float(current.risk * 2.0 * scale_out_first_contracts),
+                                        pnl=float(current.entry_price - target_price) * float(leg_q),
+                                        contracts=leg_q,
+                                        risk_dollars=float(current.risk * 2.0 * leg_q),
                                         outcome='win',
-                                        exit_reason='target_scale1',
+                                        exit_reason=f'target_scale{scale_out_stage + 1}',
                                         pivot=current.pivot,
                                         flem=current.flem,
                                         flem_saved_time=current.flem_saved_time,
@@ -792,11 +792,10 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         strong_count_recent3=current.strong_count_recent3,
                                         very_strong=current.very_strong
                                     )
-                                    trades[-1] = first_trade
-                                    daily_pnl_dollars += float(first_trade.pnl) * 2.0
-
-                                    scale_out_done = True
-                                    target_price = current.entry_price - float(scale_out_second_target_r or 4.0) * current.risk
+                                    trades[-1] = leg_trade
+                                    daily_pnl_dollars += float(leg_trade.pnl) * 2.0
+                                    scale_out_stage += 1
+                                    target_price = current.entry_price - next_r * current.risk
                                     remaining_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
@@ -805,8 +804,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         exit_time=None,
                                         exit_price=None,
                                         pnl=None,
-                                        contracts=scale_out_second_contracts,
-                                        risk_dollars=float(current.risk * 2.0 * scale_out_second_contracts),
+                                        contracts=next_q,
+                                        risk_dollars=float(current.risk * 2.0 * next_q),
                                         outcome=None,
                                         exit_reason=None,
                                         pivot=current.pivot,
@@ -825,6 +824,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     trades.append(remaining_trade)
                                     in_trade = True
                                 else:
+                                    # Final exit (last scale-out leg or no scale-out)
                                     current.outcome = 'win'
                                     hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
                                     current.exit_time = hit_time if hit_time is not None else t
@@ -834,7 +834,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     in_trade = False
                                     daily_pnl_dollars += float(current.pnl) * 2.0
                                     scale_out_active = False
-                                    scale_out_done = False
+                                    scale_out_stage = 0
 
         # End of day cleanup: force-close any unclosed trade at session end
         if trades and trades[-1].outcome is None:
@@ -853,7 +853,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
             in_trade = False
             daily_pnl_dollars += float(current.pnl) * 2.0
             scale_out_active = False
-            scale_out_done = False
+            scale_out_stage = 0
 
     return trades
 
