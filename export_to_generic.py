@@ -2,16 +2,23 @@
 """
 export_to_generic.py
 --------------------
-Exports trades_combined.csv to the generic.csv brokerage import format.
+Exports engine backtest trades to the generic.csv brokerage import format.
 
-Each trade produces TWO rows (entry + exit):
+Sources:
+  output_bnr_det_2025_allow_counter.csv  (451 rows, full 2025)
+  output_bnr_det_2026_janfeb.csv         (49 rows, Jan-Feb 2026)
+
+Each backtest row produces TWO output rows (entry leg + exit leg):
   Long : entry=Buy,  exit=Sell
   Short: entry=Sell, exit=Buy
+
+Scale-out trades (same entry_time, multiple rows) are kept as separate legs,
+each with their own contract count.
 
 MNQ rolling expiration:
   Quarterly contracts: Mar, Jun, Sep, Dec
   Expiration date = 3rd Friday of the expiration month
-  Rollover date   = Thursday before expiration (8 calendar days before)
+  Rollover date   = 8 calendar days before expiration (Thursday before)
   Active contract = earliest quarterly expiry whose rollover_date >= trade_date
 """
 
@@ -20,19 +27,20 @@ from datetime import date, timedelta
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-TRADES_CSV = "/Users/radhikaarora/Documents/Trading ML/ML V2/trades_combined.csv"
+BACKTEST_FILES = [
+    "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2025_allow_counter.csv",
+    "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2026_janfeb.csv",
+]
 OUTPUT_CSV = "/Users/radhikaarora/Documents/Trading ML/ML V2/trades_generic_export.csv"
 
-COMMISSION_PER_CONTRACT = 0.65   # $ per contract per leg
+COMMISSION_PER_CONTRACT = 0.65
 
 
 # ── MNQ rolling expiration helpers ───────────────────────────────────────────
 
 def third_friday(year: int, month: int) -> date:
     """Return the 3rd Friday of the given year/month."""
-    # Find first day of month, then first Friday, then +14 days
     d = date(year, month, 1)
-    # weekday(): Mon=0 … Fri=4 … Sun=6
     days_to_first_fri = (4 - d.weekday()) % 7
     first_fri = d + timedelta(days=days_to_first_fri)
     return first_fri + timedelta(weeks=2)
@@ -40,113 +48,111 @@ def third_friday(year: int, month: int) -> date:
 
 def mnq_expiry_for_date(trade_date: date) -> str:
     """
-    Return the active MNQ contract expiry label (e.g. 'Mar 25') for a given trade date.
-
-    Logic:
-      - MNQ trades quarterly: Mar, Jun, Sep, Dec
-      - Contract expires on the 3rd Friday of the expiry month
-      - Rollover to next contract on the Thursday before expiry
-        (rollover_date = expiry_date - 8 days)
-      - Active contract = the first quarterly expiry whose rollover_date >= trade_date
+    Return the active MNQ contract label (e.g. 'Mar 25') for a trade date.
+    Active contract = first quarterly expiry whose rollover_date >= trade_date,
+    where rollover_date = expiry - 8 days.
     """
-    QUARTERLY_MONTHS = [3, 6, 9, 12]   # Mar, Jun, Sep, Dec
-    MONTH_ABBR = {1:"Jan", 2:"Feb", 3:"Mar", 4:"Apr", 5:"May", 6:"Jun",
-                  7:"Jul", 8:"Aug", 9:"Sep", 10:"Oct", 11:"Nov", 12:"Dec"}
+    QUARTERLY_MONTHS = [3, 6, 9, 12]
+    MONTH_ABBR = {3:"Mar", 6:"Jun", 9:"Sep", 12:"Dec"}
 
-    # Check 8 consecutive quarterly contracts starting from 2 years back
     year = trade_date.year - 1
     candidates = []
-    for _ in range(12):   # enough quarters
+    for _ in range(6):
         for m in QUARTERLY_MONTHS:
             expiry   = third_friday(year, m)
-            rollover = expiry - timedelta(days=8)   # Thursday before
-            candidates.append((expiry, rollover, year, m))
+            rollover = expiry - timedelta(days=8)
+            candidates.append((rollover, expiry, year, m))
         year += 1
 
-    for expiry, rollover, yr, mo in sorted(candidates):
+    for rollover, expiry, yr, mo in sorted(candidates):
         if rollover >= trade_date:
-            yy = str(yr)[-2:]
-            return f"{MONTH_ABBR[mo]} {yy}"
+            return f"{MONTH_ABBR[mo]} {str(yr)[-2:]}"
 
     raise ValueError(f"Could not determine MNQ contract for {trade_date}")
 
 
-# ── Load trades ───────────────────────────────────────────────────────────────
+# ── Load and combine backtest files ───────────────────────────────────────────
 
-print("Loading trades …")
-df = pd.read_csv(TRADES_CSV)
-print(f"  {len(df)} rows")
+print("Loading backtest files …")
+dfs = []
+for path in BACKTEST_FILES:
+    df = pd.read_csv(path)
+    print(f"  {path.split('/')[-1]}: {len(df)} rows")
+    dfs.append(df)
+
+df = pd.concat(dfs, ignore_index=True)
+df = df.sort_values("entry_time").reset_index(drop=True)
+print(f"  Total: {len(df)} rows\n")
 
 
-# ── Build output rows ─────────────────────────────────────────────────────────
+# ── Build generic.csv rows ────────────────────────────────────────────────────
 
-def strip_tz(time_str: str) -> str:
-    """'09:38:00 EST' → '09:38:00'"""
-    return str(time_str).strip().split()[0]
+def parse_time(ts_str: str) -> str:
+    """'2025-01-03 09:57:00-05:00' → '09:57:00'"""
+    return pd.Timestamp(ts_str).strftime("%H:%M:%S")
 
+def parse_date(ts_str: str) -> str:
+    """'2025-01-03 09:57:00-05:00' → '01/03/25'"""
+    return pd.Timestamp(ts_str).strftime("%m/%d/%y")
 
-def fmt_date(date_str: str) -> str:
-    """'2025-01-03' → '01/03/25'"""
-    d = pd.Timestamp(date_str)
-    return d.strftime("%m/%d/%y")
+def trade_date_obj(ts_str: str) -> date:
+    return pd.Timestamp(ts_str).date()
 
 
 rows = []
 
-for _, trade in df.iterrows():
-    open_date  = str(trade["Open Date"]).strip()
-    open_time  = strip_tz(trade["Open Time"])
-    close_time = strip_tz(trade["Close Time"])
-    side       = str(trade["Side"]).strip().lower()
-    qty        = int(trade["Executions"])
-    entry_px   = float(trade["Entry Price"])
-    exit_px    = float(trade["Exit Price"])
-    symbol     = str(trade["Symbol"]).strip()
+# Group by trade identity so scale-outs share one entry row
+for (entry_ts, entry_px, direction), group in df.groupby(
+        ["entry_time", "entry_price", "direction"], sort=False):
 
-    trade_date = pd.Timestamp(open_date).date()
-    date_fmt   = fmt_date(open_date)
-    expiry     = mnq_expiry_for_date(trade_date)
-    commission = round(COMMISSION_PER_CONTRACT * qty, 4)
+    group      = group.sort_values("exit_time")
+    entry_ts   = str(entry_ts)
+    direction  = str(direction).strip().lower()
+    entry_px   = float(entry_px)
+    total_qty  = int(group["contracts"].sum())
 
-    # Entry / exit buy-sell labels
-    if side == "long":
-        entry_side = "Buy"
-        exit_side  = "Sell"
-    else:
-        entry_side = "Sell"
-        exit_side  = "Buy"
+    d          = trade_date_obj(entry_ts)
+    date_fmt   = parse_date(entry_ts)
+    expiry     = mnq_expiry_for_date(d)
 
-    # Entry row
+    entry_side = "Buy"  if direction == "long"  else "Sell"
+    exit_side  = "Sell" if direction == "long"  else "Buy"
+
+    # Single entry row with total contracts
     rows.append({
-        "Date":        date_fmt,
-        "Time":        open_time,
-        "Symbol":      symbol,
-        "Buy/Sell":    entry_side,
-        "Quantity":    qty,
-        "Price":       entry_px,
-        "Spread":      "Future",
-        "Expiration":  expiry,
-        "Strike":      "",
-        "Call/Put":    "",
-        "Commission":  commission,
-        "Fees":        "",
+        "Date":       date_fmt,
+        "Time":       parse_time(entry_ts),
+        "Symbol":     "MNQ",
+        "Buy/Sell":   entry_side,
+        "Quantity":   total_qty,
+        "Price":      entry_px,
+        "Spread":     "Future",
+        "Expiration": expiry,
+        "Strike":     "",
+        "Call/Put":   "",
+        "Commission": round(COMMISSION_PER_CONTRACT * total_qty, 4),
+        "Fees":       "",
     })
 
-    # Exit row
-    rows.append({
-        "Date":        date_fmt,
-        "Time":        close_time,
-        "Symbol":      symbol,
-        "Buy/Sell":    exit_side,
-        "Quantity":    qty,
-        "Price":       exit_px,
-        "Spread":      "Future",
-        "Expiration":  expiry,
-        "Strike":      "",
-        "Call/Put":    "",
-        "Commission":  commission,
-        "Fees":        "",
-    })
+    # One exit row per leg
+    for _, leg in group.iterrows():
+        exit_ts = str(leg["exit_time"])
+        qty     = int(leg["contracts"])
+        exit_px = float(leg["exit_price"])
+        rows.append({
+            "Date":       parse_date(exit_ts),
+            "Time":       parse_time(exit_ts),
+            "Symbol":     "MNQ",
+            "Buy/Sell":   exit_side,
+            "Quantity":   qty,
+            "Price":      exit_px,
+            "Spread":     "Future",
+            "Expiration": expiry,
+            "Strike":     "",
+            "Call/Put":   "",
+            "Commission": round(COMMISSION_PER_CONTRACT * qty, 4),
+            "Fees":       "",
+        })
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -157,13 +163,15 @@ out = pd.DataFrame(rows, columns=[
 ])
 
 out.to_csv(OUTPUT_CSV, index=False)
-print(f"\n✓ Exported {len(df)} trades ({len(out)} rows) → trades_generic_export.csv")
+print(f"✓ Exported {len(df)} trades ({len(out)} rows) → {OUTPUT_CSV.split('/')[-1]}")
 
-# ── Spot-check ────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 
-print("\nFirst 10 rows:")
-print(out.head(10).to_string(index=False))
+print("\nDate range:", out["Date"].iloc[0], "→", out["Date"].iloc[-1])
+print("\nExpiration breakdown (trades):")
+# one row per trade = entry row
+entries = out[out["Buy/Sell"].isin(["Buy", "Sell"])].iloc[::2]
+print(entries.groupby("Expiration").size().to_string())
 
-# Verify expiration boundaries
-print("\nExpiration summary:")
-print(out.groupby("Expiration")["Date"].agg(["first", "last", "count"]).to_string())
+print("\nSample (first 8 rows):")
+print(out.head(8).to_string(index=False))

@@ -230,7 +230,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         current.exit_price = float(close)
                         current.stop_time = t
                         current.stop_price = float(stop_price) if stop_price is not None else None
-                        current.pnl = float(current.exit_price - current.entry_price)
+                        current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
                         current.exit_reason = 'direction_flip'
                         in_trade = False
                         daily_pnl_dollars += float(current.pnl) * 2.0
@@ -262,7 +262,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         current.exit_price = float(close)
                         current.stop_time = t
                         current.stop_price = float(stop_price) if stop_price is not None else None
-                        current.pnl = float(current.entry_price - current.exit_price)
+                        current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
                         current.exit_reason = 'direction_flip'
                         in_trade = False
                         daily_pnl_dollars += float(current.pnl) * 2.0
@@ -473,7 +473,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     zone_bar = day_1m.loc[day_1m['timestamp'] == zone_time].iloc[0]
                                 except Exception:
                                     zone_bar = None
-                                day_range = float(day_1m['high'].max() - day_1m['low'].min()) if not day_1m.empty else 0.0
+                                day_1m_to_now = day_1m[day_1m['timestamp'] <= t]
+                                day_range = float(day_1m_to_now['high'].max() - day_1m_to_now['low'].min()) if not day_1m_to_now.empty else 0.0
                                 if direction == 'long':
                                     zone_price = float(zone_bar['high']) if zone_bar is not None else None
                                     dist_zone = (flem - zone_price) if zone_price is not None else None
@@ -510,7 +511,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         zone_bar = day_1m.loc[day_1m['timestamp'] == zone_time].iloc[0]
                     except Exception:
                         zone_bar = None
-                    day_range = float(day_1m['high'].max() - day_1m['low'].min()) if not day_1m.empty else 0.0
+                    day_1m_to_now = day_1m[day_1m['timestamp'] <= t]
+                    day_range = float(day_1m_to_now['high'].max() - day_1m_to_now['low'].min()) if not day_1m_to_now.empty else 0.0
                     if direction == 'long':
                         zone_price = float(zone_bar['high']) if zone_bar is not None else None
                         dist_zone = (flem - zone_price) if zone_price is not None else None
@@ -581,9 +583,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 continue
 
                             # Scale-out rule:
-                            # - contracts > 13 => 50% at 1.2R, remainder at 4R
-                            # - contracts < 13 => 50% at 1.2R, remainder at 2R
-                            scale_out_active = contracts != 13
+                            # - contracts >= 13 => 50% at 1.2R, remainder at 4R
+                            # - contracts < 13  => 50% at 1.2R, remainder at 2R
+                            scale_out_active = True
                             scale_out_done = False
                             if scale_out_active:
                                 scale_out_first_contracts = contracts // 2
@@ -593,9 +595,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     scale_out_first_contracts = 0
                                     scale_out_second_contracts = 0
                             scale_out_second_target_r = None
-                            if contracts > 13:
+                            if contracts >= 13:
                                 scale_out_second_target_r = 4.0
-                            elif contracts < 13:
+                            else:
                                 scale_out_second_target_r = 2.0
                             trades.append(Trade(
                                 day=str(day),
