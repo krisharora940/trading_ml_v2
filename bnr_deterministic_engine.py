@@ -2,6 +2,8 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Optional, List
 from datetime import timedelta
+import joblib
+import os
 
 ONE_MIN = pd.Timedelta(minutes=1)
 THIRTY_SEC = pd.Timedelta(seconds=30)
@@ -56,12 +58,18 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
     df_1m['event_time'] = df_1m['timestamp'] + ONE_MIN
     df_30s['event_time'] = df_30s['timestamp'] + THIRTY_SEC
 
-    # Precompute ATR on 1m
+    # Precompute ATR on 1m (day-wide)
     df_1m['atr'] = compute_atr(df_1m)
 
     # Build per-day grouping on local date (timestamp already tz-aware)
     df_1m['day'] = df_1m['timestamp'].dt.date
     df_30s['day'] = df_30s['timestamp'].dt.date
+
+    # Load ML model for entry validation (if available)
+    model_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model.joblib"
+    ml_bundle = joblib.load(model_path) if os.path.exists(model_path) else None
+    ml_model = ml_bundle['model'] if ml_bundle else None
+    ml_features = ml_bundle['features'] if ml_bundle else None
 
     for day, day_1m in df_1m.groupby('day'):
         day_30s = df_30s[df_30s['day'] == day]
@@ -127,17 +135,31 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
         entry_time = None
         entry_price = None
         last_3_strong = []
+        # ML retrace window accumulators (30s candles since pivot_time)
+        body_sum_30s = 0.0
+        body_count_30s = 0
+        in_dir_count_30s = 0
+        max_run_30s = 0
+        run_30s = 0
+        last_body_30s = None
+        last_30s_close = None
+        top2_scores = []
 
         # For trades-in-progress
         in_trade = False
         stop_price = None
         target_price = None
+        scale_out_active = False
+        scale_out_done = False
+        scale_out_first_contracts = 0
+        scale_out_second_contracts = 0
+        scale_out_second_target_r = None
+        daily_pnl_dollars = 0.0
 
         for _, ev in events.iterrows():
             t = ev['event_time']
             if t < zone_known_time:
                 continue
-
             # Invalidation on 30s close
             if ev['kind'] == '30s' and candidate_active and not in_trade:
                 close = ev['close']
@@ -150,6 +172,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     pivot = None
                     entry_triggered = False
                     last_3_strong = []
+                    body_sum_30s = 0.0
+                    body_count_30s = 0
+                    in_dir_count_30s = 0
+                    max_run_30s = 0
+                    run_30s = 0
+                    last_body_30s = None
+                    last_30s_close = None
+                    top2_scores = []
                     continue
                 if direction == 'short' and close > zone_high:
                     direction = None
@@ -159,7 +189,31 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     pivot = None
                     entry_triggered = False
                     last_3_strong = []
+                    body_sum_30s = 0.0
+                    body_count_30s = 0
+                    in_dir_count_30s = 0
+                    max_run_30s = 0
+                    run_30s = 0
+                    last_body_30s = None
+                    last_30s_close = None
+                    top2_scores = []
                     continue
+
+            # Update ML retrace window accumulators on 30s bars
+            if ev['kind'] == '30s' and reentry_seen and not entry_triggered and pivot_time is not None:
+                if ev['timestamp'] >= pivot_time:
+                    body = abs(ev['close'] - ev['open'])
+                    last_body_30s = body
+                    last_30s_close = ev['close']
+                    body_sum_30s += body
+                    body_count_30s += 1
+                    in_dir = (ev['close'] > ev['open']) if direction == 'long' else (ev['close'] < ev['open'])
+                    in_dir_count_30s += 1 if in_dir else 0
+                    if in_dir:
+                        run_30s += 1
+                        max_run_30s = max(max_run_30s, run_30s)
+                    else:
+                        run_30s = 0
 
             if ev['kind'] == '1m':
                 close = ev['close']
@@ -179,6 +233,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         current.pnl = float(current.exit_price - current.entry_price)
                         current.exit_reason = 'direction_flip'
                         in_trade = False
+                        daily_pnl_dollars += float(current.pnl) * 2.0
+                        scale_out_active = False
+                        scale_out_done = False
                     direction = 'short'
                     candidate_active = True
                     reentry_seen = False
@@ -188,6 +245,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     last_3_strong = []
                     stop_price = None
                     target_price = None
+                    body_sum_30s = 0.0
+                    body_count_30s = 0
+                    in_dir_count_30s = 0
+                    max_run_30s = 0
+                    run_30s = 0
+                    last_body_30s = None
+                    last_30s_close = None
+                    top2_scores = []
 
                 elif candidate_active and direction == 'short' and close > zone_high:
                     if in_trade and trades and trades[-1].outcome is None:
@@ -200,6 +265,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         current.pnl = float(current.entry_price - current.exit_price)
                         current.exit_reason = 'direction_flip'
                         in_trade = False
+                        daily_pnl_dollars += float(current.pnl) * 2.0
+                        scale_out_active = False
+                        scale_out_done = False
                     direction = 'long'
                     candidate_active = True
                     reentry_seen = False
@@ -209,6 +277,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     last_3_strong = []
                     stop_price = None
                     target_price = None
+                    body_sum_30s = 0.0
+                    body_count_30s = 0
+                    in_dir_count_30s = 0
+                    max_run_30s = 0
+                    run_30s = 0
+                    last_body_30s = None
+                    last_30s_close = None
+                    top2_scores = []
 
                 # Break detection if not active
                 if not candidate_active:
@@ -224,7 +300,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                 # Track FLEM until a valid retest close into the zone
                 if candidate_active and not reentry_seen:
                     if direction == 'long':
-                        flem = high if flem is None else max(flem, high)
+                        if flem is None or high > flem:
+                            flem = high if flem is None else max(flem, high)
                         # Retest: candle closes opposite direction and touches/enters zone
                         if close < ev['open'] and low <= zone_high and high >= zone_low:
                             reentry_seen = True
@@ -232,17 +309,76 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                             flem_saved_time = t
                             pivot = low
                             pivot_time = t
+                            body_sum_30s = 0.0
+                            body_count_30s = 0
+                            in_dir_count_30s = 0
+                            max_run_30s = 0
+                            run_30s = 0
+                            last_body_30s = None
+                            last_30s_close = None
+                            top2_scores = []
                     else:
-                        flem = low if flem is None else min(flem, low)
+                        if flem is None or low < flem:
+                            flem = low if flem is None else min(flem, low)
                         if close > ev['open'] and low <= zone_high and high >= zone_low:
                             reentry_seen = True
                             reentry_time = t
                             flem_saved_time = t
                             pivot = high
                             pivot_time = t
+                            body_sum_30s = 0.0
+                            body_count_30s = 0
+                            in_dir_count_30s = 0
+                            max_run_30s = 0
+                            run_30s = 0
+                            last_body_30s = None
+                            last_30s_close = None
+                            top2_scores = []
 
                 # After reentry: update pivot until entry
                 if reentry_seen and not entry_triggered:
+                    # If retrace exceeds 1.2 before entry, reset setup to seek next re-entry
+                    if flem is not None and pivot is not None and flem != pivot:
+                        if direction == 'long':
+                            retrace_reset = (close - pivot) / (flem - pivot)
+                            if retrace_reset > 1.2:
+                                flem = high
+                                flem_saved_time = None
+                                reentry_seen = False
+                                reentry_time = None
+                                pivot = None
+                                pivot_time = None
+                                entry_triggered = False
+                                last_3_strong = []
+                                body_sum_30s = 0.0
+                                body_count_30s = 0
+                                in_dir_count_30s = 0
+                                max_run_30s = 0
+                                run_30s = 0
+                                last_body_30s = None
+                                last_30s_close = None
+                                top2_scores = []
+                                continue
+                        else:
+                            retrace_reset = (pivot - close) / (pivot - flem)
+                            if retrace_reset > 1.2:
+                                flem = low
+                                flem_saved_time = None
+                                reentry_seen = False
+                                reentry_time = None
+                                pivot = None
+                                pivot_time = None
+                                entry_triggered = False
+                                last_3_strong = []
+                                body_sum_30s = 0.0
+                                body_count_30s = 0
+                                in_dir_count_30s = 0
+                                max_run_30s = 0
+                                run_30s = 0
+                                last_body_30s = None
+                                last_30s_close = None
+                                top2_scores = []
+                                continue
                     # If retrace violates the far side of the zone before entry, invalidate candidate
                     if direction == 'long' and low < zone_low:
                         direction = None
@@ -255,6 +391,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         pivot_time = None
                         entry_triggered = False
                         last_3_strong = []
+                        body_sum_30s = 0.0
+                        body_count_30s = 0
+                        in_dir_count_30s = 0
+                        max_run_30s = 0
+                        run_30s = 0
+                        last_body_30s = None
+                        last_30s_close = None
+                        top2_scores = []
                         continue
                     if direction == 'short' and high > zone_high:
                         direction = None
@@ -267,6 +411,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         pivot_time = None
                         entry_triggered = False
                         last_3_strong = []
+                        body_sum_30s = 0.0
+                        body_count_30s = 0
+                        in_dir_count_30s = 0
+                        max_run_30s = 0
+                        run_30s = 0
+                        last_body_30s = None
+                        last_30s_close = None
+                        top2_scores = []
                         continue
 
                     if direction == 'long':
@@ -301,9 +453,95 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         else:
                             retrace = (pivot - close) / (pivot - flem)
 
-                    # Entry condition
-                    if retrace is not None and retrace >= 0.35 and retrace <= 1.2:
-                        if strong_count >= 2 or very_strong:
+                    # Entry condition (ML overrides strong/very-strong if model is available)
+                    ml_allows_entry = False
+                    if ml_model is not None and ml_features is not None and last_30s_close is not None:
+                        pivot_flem_dist = abs(pivot - flem) if (pivot is not None and flem is not None) else None
+                        time_since_pivot = (t - pivot_time).total_seconds() if pivot_time is not None else None
+                        if pivot_flem_dist not in (0, None) and time_since_pivot is not None and body_count_30s > 0:
+                            if direction == 'long':
+                                retrace_ml = (last_30s_close - pivot) / (flem - pivot) if flem != pivot else None
+                            else:
+                                retrace_ml = (pivot - last_30s_close) / (pivot - flem) if flem != pivot else None
+                            if retrace_ml is not None:
+                                body_mean = body_sum_30s / body_count_30s
+                                in_dir_ratio = in_dir_count_30s / body_count_30s
+                                # 9:30 zone and day range for zone/pivot over range features
+                                day_key = t.date()
+                                zone_time = pd.Timestamp(f"{day_key} 09:30:00", tz=day_1m['timestamp'].dt.tz)
+                                try:
+                                    zone_bar = day_1m.loc[day_1m['timestamp'] == zone_time].iloc[0]
+                                except Exception:
+                                    zone_bar = None
+                                day_range = float(day_1m['high'].max() - day_1m['low'].min()) if not day_1m.empty else 0.0
+                                if direction == 'long':
+                                    zone_price = float(zone_bar['high']) if zone_bar is not None else None
+                                    dist_zone = (flem - zone_price) if zone_price is not None else None
+                                else:
+                                    zone_price = float(zone_bar['low']) if zone_bar is not None else None
+                                    dist_zone = (zone_price - flem) if zone_price is not None else None
+                                zone_over_range = (dist_zone / day_range) if (dist_zone is not None and day_range not in (0.0, None)) else 0.0
+                                pivot_over_range = (pivot_flem_dist / day_range) if (day_range not in (0.0, None)) else 0.0
+
+                                features = {
+                                    'retrace': retrace_ml,
+                                    'pivot_flem_dist': pivot_flem_dist,
+                                    'time_since_pivot_sec': time_since_pivot,
+                                    'body_last': last_body_30s or 0.0,
+                                    'body_sum': body_sum_30s,
+                                    'body_mean': body_mean,
+                                    'in_dir_ratio': in_dir_ratio,
+                                    'max_in_dir_run': max_run_30s,
+                                    'bars_since_pivot': body_count_30s,
+                                    'zone_over_range': zone_over_range,
+                                    'pivot_over_range': pivot_over_range
+                                }
+                                x = pd.DataFrame([features])[ml_features].fillna(0.0)
+                                score = float(ml_model.predict_proba(x)[0][1])
+                                top2_scores.append(score)
+                                top2_scores = sorted(top2_scores, reverse=True)[:2]
+                                ml_allows_entry = score >= min(top2_scores) if len(top2_scores) == 2 else False
+
+                    # Displacement category based on zone/pivot distance over day range
+                    day_key = t.date()
+                    pivot_flem_dist = abs(flem - pivot)
+                    zone_time = pd.Timestamp(f"{day_key} 09:30:00", tz=day_1m['timestamp'].dt.tz)
+                    try:
+                        zone_bar = day_1m.loc[day_1m['timestamp'] == zone_time].iloc[0]
+                    except Exception:
+                        zone_bar = None
+                    day_range = float(day_1m['high'].max() - day_1m['low'].min()) if not day_1m.empty else 0.0
+                    if direction == 'long':
+                        zone_price = float(zone_bar['high']) if zone_bar is not None else None
+                        dist_zone = (flem - zone_price) if zone_price is not None else None
+                    else:
+                        zone_price = float(zone_bar['low']) if zone_bar is not None else None
+                        dist_zone = (zone_price - flem) if zone_price is not None else None
+                    zone_over_range = (dist_zone / day_range) if (dist_zone is not None and day_range not in (0.0, None)) else 0.0
+                    pivot_over_range = (pivot_flem_dist / day_range) if (day_range not in (0.0, None)) else 0.0
+
+                    if zone_over_range >= 0.10568226033342312 and pivot_over_range >= 0.3795379537953795:
+                        displacement_category = 'high'
+                    elif zone_over_range <= 0.0848692546366965 and pivot_over_range <= 0.23516193082722905:
+                        displacement_category = 'low'
+                    else:
+                        displacement_category = 'medium'
+
+                    min_retrace = 0.45 if displacement_category == 'high' else 0.35
+
+                    # Require prior 1m candle to close in the direction of the trade
+                    prev_1m = day_1m.loc[day_1m['timestamp'] == (t - ONE_MIN)]
+                    prev_color_ok = True
+                    if not prev_1m.empty:
+                        prev_close = float(prev_1m.iloc[0]['close'])
+                        prev_open = float(prev_1m.iloc[0]['open'])
+                        if direction == 'long':
+                            prev_color_ok = prev_close > prev_open
+                        else:
+                            prev_color_ok = prev_close < prev_open
+
+                    if retrace is not None and retrace >= min_retrace and retrace <= 1.2 and prev_color_ok:
+                        if (ml_model is not None and ml_allows_entry) or (ml_model is None and (strong_count >= 2 or very_strong)):
                             entry_triggered = True
                             in_trade = True
                             entry_time = t
@@ -327,6 +565,38 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 stop_price = None
                                 target_price = None
                                 continue
+                            if contracts <= 2:
+                                # Skip trade if position size is too small
+                                entry_triggered = False
+                                in_trade = False
+                                stop_price = None
+                                target_price = None
+                                continue
+                            if contracts >= 29:
+                                # Skip trade if position size is too large
+                                entry_triggered = False
+                                in_trade = False
+                                stop_price = None
+                                target_price = None
+                                continue
+
+                            # Scale-out rule:
+                            # - contracts > 13 => 50% at 1.2R, remainder at 4R
+                            # - contracts < 13 => 50% at 1.2R, remainder at 2R
+                            scale_out_active = contracts != 13
+                            scale_out_done = False
+                            if scale_out_active:
+                                scale_out_first_contracts = contracts // 2
+                                scale_out_second_contracts = contracts - scale_out_first_contracts
+                                if scale_out_first_contracts == 0 or scale_out_second_contracts == 0:
+                                    scale_out_active = False
+                                    scale_out_first_contracts = 0
+                                    scale_out_second_contracts = 0
+                            scale_out_second_target_r = None
+                            if contracts > 13:
+                                scale_out_second_target_r = 4.0
+                            elif contracts < 13:
+                                scale_out_second_target_r = 2.0
                             trades.append(Trade(
                                 day=str(day),
                                 direction=direction,
@@ -352,11 +622,10 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 strong_count_recent3=strong_count,
                                 very_strong=bool(very_strong)
                             ))
-
-                # Manage trade (stop/target) using 1m bars
-                if in_trade and trades:
-                    current = trades[-1]
-                    if current.outcome is None:
+            # Manage trade (stop/target) using 1m bars
+            if in_trade and trades:
+                current = trades[-1]
+                if current.outcome is None:
                         # Prevent same-bar exits that would rely on earlier 30s data
                         if current.entry_time == t:
                             continue
@@ -401,14 +670,83 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 current.stop_price = float(stop_price)
                                 current.exit_reason = 'stop'
                                 in_trade = False
+                                daily_pnl_dollars += float(current.pnl) * 2.0
+                                scale_out_active = False
+                                scale_out_done = False
                             elif high >= target_price:
-                                current.outcome = 'win'
-                                hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
-                                current.exit_time = hit_time if hit_time is not None else t
-                                current.exit_price = float(target_price)
-                                current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
-                                current.exit_reason = 'target'
-                                in_trade = False
+                                # Scale-out: take partial at 1.2R, keep remainder to fixed-R target
+                                if scale_out_active and not scale_out_done:
+                                    hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
+                                    first_exit_time = hit_time if hit_time is not None else t
+                                    first_trade = Trade(
+                                        day=current.day,
+                                        direction=current.direction,
+                                        entry_time=current.entry_time,
+                                        entry_price=current.entry_price,
+                                        exit_time=first_exit_time,
+                                        exit_price=float(target_price),
+                                        pnl=float(target_price - current.entry_price) * float(scale_out_first_contracts),
+                                        contracts=scale_out_first_contracts,
+                                        risk_dollars=float(current.risk * 2.0 * scale_out_first_contracts),
+                                        outcome='win',
+                                        exit_reason='target_scale1',
+                                        pivot=current.pivot,
+                                        flem=current.flem,
+                                        flem_saved_time=current.flem_saved_time,
+                                        reentry_time=current.reentry_time,
+                                        pivot_time=current.pivot_time,
+                                        risk=current.risk,
+                                        target=current.target,
+                                        stop_time=None,
+                                        stop_price=current.stop_price,
+                                        retrace_at_entry=current.retrace_at_entry,
+                                        strong_count_recent3=current.strong_count_recent3,
+                                        very_strong=current.very_strong
+                                    )
+                                    trades[-1] = first_trade
+                                    daily_pnl_dollars += float(first_trade.pnl) * 2.0
+
+                                    # Continue with remaining size toward fixed-R target
+                                    scale_out_done = True
+                                    target_price = current.entry_price + float(scale_out_second_target_r or 4.0) * current.risk
+                                    remaining_trade = Trade(
+                                        day=current.day,
+                                        direction=current.direction,
+                                        entry_time=current.entry_time,
+                                        entry_price=current.entry_price,
+                                        exit_time=None,
+                                        exit_price=None,
+                                        pnl=None,
+                                        contracts=scale_out_second_contracts,
+                                        risk_dollars=float(current.risk * 2.0 * scale_out_second_contracts),
+                                        outcome=None,
+                                        exit_reason=None,
+                                        pivot=current.pivot,
+                                        flem=current.flem,
+                                        flem_saved_time=current.flem_saved_time,
+                                        reentry_time=current.reentry_time,
+                                        pivot_time=current.pivot_time,
+                                        risk=current.risk,
+                                        target=float(target_price),
+                                        stop_time=None,
+                                        stop_price=current.stop_price,
+                                        retrace_at_entry=current.retrace_at_entry,
+                                        strong_count_recent3=current.strong_count_recent3,
+                                        very_strong=current.very_strong
+                                    )
+                                    trades.append(remaining_trade)
+                                    in_trade = True
+                                else:
+                                    current.outcome = 'win'
+                                    hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
+                                    current.exit_time = hit_time if hit_time is not None else t
+                                    current.exit_price = float(target_price)
+                                    current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
+                                    current.exit_reason = 'target'
+                                    in_trade = False
+                                    daily_pnl_dollars += float(current.pnl) * 2.0
+                                    scale_out_active = False
+                                    scale_out_done = False
                         else:
                             # Stop is based on 1m close above pivot
                             if close >= stop_price:
@@ -420,14 +758,81 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 current.stop_price = float(stop_price)
                                 current.exit_reason = 'stop'
                                 in_trade = False
+                                daily_pnl_dollars += float(current.pnl) * 2.0
+                                scale_out_active = False
+                                scale_out_done = False
                             elif low <= target_price:
-                                current.outcome = 'win'
-                                hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
-                                current.exit_time = hit_time if hit_time is not None else t
-                                current.exit_price = float(target_price)
-                                current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
-                                current.exit_reason = 'target'
-                                in_trade = False
+                                if scale_out_active and not scale_out_done:
+                                    hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
+                                    first_exit_time = hit_time if hit_time is not None else t
+                                    first_trade = Trade(
+                                        day=current.day,
+                                        direction=current.direction,
+                                        entry_time=current.entry_time,
+                                        entry_price=current.entry_price,
+                                        exit_time=first_exit_time,
+                                        exit_price=float(target_price),
+                                        pnl=float(current.entry_price - target_price) * float(scale_out_first_contracts),
+                                        contracts=scale_out_first_contracts,
+                                        risk_dollars=float(current.risk * 2.0 * scale_out_first_contracts),
+                                        outcome='win',
+                                        exit_reason='target_scale1',
+                                        pivot=current.pivot,
+                                        flem=current.flem,
+                                        flem_saved_time=current.flem_saved_time,
+                                        reentry_time=current.reentry_time,
+                                        pivot_time=current.pivot_time,
+                                        risk=current.risk,
+                                        target=current.target,
+                                        stop_time=None,
+                                        stop_price=current.stop_price,
+                                        retrace_at_entry=current.retrace_at_entry,
+                                        strong_count_recent3=current.strong_count_recent3,
+                                        very_strong=current.very_strong
+                                    )
+                                    trades[-1] = first_trade
+                                    daily_pnl_dollars += float(first_trade.pnl) * 2.0
+
+                                    scale_out_done = True
+                                    target_price = current.entry_price - float(scale_out_second_target_r or 4.0) * current.risk
+                                    remaining_trade = Trade(
+                                        day=current.day,
+                                        direction=current.direction,
+                                        entry_time=current.entry_time,
+                                        entry_price=current.entry_price,
+                                        exit_time=None,
+                                        exit_price=None,
+                                        pnl=None,
+                                        contracts=scale_out_second_contracts,
+                                        risk_dollars=float(current.risk * 2.0 * scale_out_second_contracts),
+                                        outcome=None,
+                                        exit_reason=None,
+                                        pivot=current.pivot,
+                                        flem=current.flem,
+                                        flem_saved_time=current.flem_saved_time,
+                                        reentry_time=current.reentry_time,
+                                        pivot_time=current.pivot_time,
+                                        risk=current.risk,
+                                        target=float(target_price),
+                                        stop_time=None,
+                                        stop_price=current.stop_price,
+                                        retrace_at_entry=current.retrace_at_entry,
+                                        strong_count_recent3=current.strong_count_recent3,
+                                        very_strong=current.very_strong
+                                    )
+                                    trades.append(remaining_trade)
+                                    in_trade = True
+                                else:
+                                    current.outcome = 'win'
+                                    hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
+                                    current.exit_time = hit_time if hit_time is not None else t
+                                    current.exit_price = float(target_price)
+                                    current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
+                                    current.exit_reason = 'target'
+                                    in_trade = False
+                                    daily_pnl_dollars += float(current.pnl) * 2.0
+                                    scale_out_active = False
+                                    scale_out_done = False
 
         # End of day cleanup: force-close any unclosed trade at session end
         if trades and trades[-1].outcome is None:
@@ -444,6 +849,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                 current.pnl = float(current.entry_price - close) * float(current.contracts or 0)
             current.exit_reason = 'forced_close'
             in_trade = False
+            daily_pnl_dollars += float(current.pnl) * 2.0
+            scale_out_active = False
+            scale_out_done = False
 
     return trades
 
