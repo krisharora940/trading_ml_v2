@@ -65,18 +65,15 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
     df_1m['day'] = df_1m['timestamp'].dt.date
     df_30s['day'] = df_30s['timestamp'].dt.date
 
-    # Load ML models for entry validation (pwin + pvalid dual-threshold)
-    PWIN_THRESH   = 0.45  # P(Net P&L > 0) minimum  — tune with analyze_thresholds.py
-    PVALID_THRESH = 0.45  # P(Setup Valid) minimum   — tune with analyze_thresholds.py
-    _pwin_path   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin.joblib"
-    _pvalid_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pvalid.joblib"
+    # Load timing model (trained on 30s retrace bars, not entry-level features)
+    # Retrain with retrain_timing_model.py; tune threshold with analyze_thresholds.py
+    ENTRY_THRESH = 0.10   # P(this bar is the correct entry timing) — from retrain_timing_model.py
     _entry_path  = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model.joblib"
-    ml_model_pwin   = joblib.load(_pwin_path)   if os.path.exists(_pwin_path)   else None
-    ml_model_pvalid = joblib.load(_pvalid_path) if os.path.exists(_pvalid_path) else None
-    # pwin/pvalid are raw XGBClassifier objects; entry_model.joblib is a dict with 'features'
     _entry_bundle = joblib.load(_entry_path) if os.path.exists(_entry_path) else None
-    ml_features   = _entry_bundle['features'] if _entry_bundle else None
-    ml_model = ml_model_pwin  # fallback reference for legacy checks
+    ml_model    = _entry_bundle['model']    if _entry_bundle else None
+    ml_features = _entry_bundle['features'] if _entry_bundle else None
+    ml_model_pwin   = None   # legacy — replaced by single timing model
+    ml_model_pvalid = None   # legacy — replaced by single timing model
 
     for day, day_1m in df_1m.groupby('day'):
         day_30s = df_30s[df_30s['day'] == day]
@@ -503,9 +500,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     'pivot_over_range': pivot_over_range
                                 }
                                 x = pd.DataFrame([features])[ml_features].fillna(0.0)
-                                pwin_score  = float(ml_model_pwin.predict_proba(x)[0][1])  if ml_model_pwin   else 1.0
-                                pvalid_score = float(ml_model_pvalid.predict_proba(x)[0][1]) if ml_model_pvalid else 1.0
-                                ml_allows_entry = pwin_score >= PWIN_THRESH and pvalid_score >= PVALID_THRESH
+                                timing_score = float(ml_model.predict_proba(x)[0][1])
+                                ml_allows_entry = timing_score >= ENTRY_THRESH
 
                     # Displacement category based on zone/pivot distance over day range
                     day_key = t.date()
@@ -865,22 +861,24 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
 
 
 def main():
-    p1 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_1m.csv"
-    p2 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_30s.csv"
+    p1_2025 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_1m.csv"
+    p2_full = "/Users/radhikaarora/Documents/New Project/output/market/mnq_30s_full.csv"
+    p1_2026 = "/Users/radhikaarora/Documents/New Project/Input Data/market/mnq_1m_jan_feb_2026.csv"
 
-    df_1m = pd.read_csv(p1)
-    df_30s = pd.read_csv(p2)
+    df_1m_2025 = pd.read_csv(p1_2025)
+    df_30s     = pd.read_csv(p2_full)
+    df_1m_2026 = pd.read_csv(p1_2026)
 
     # Parse timestamps
-    # Normalize to a single timezone
-    df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], utc=True).dt.tz_convert("America/New_York")
-    df_30s['timestamp'] = pd.to_datetime(df_30s['timestamp'], utc=True).dt.tz_convert("America/New_York")
+    for df in (df_1m_2025, df_30s, df_1m_2026):
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert("America/New_York")
 
-    ranges = [
-        ("2025-01-01", "2025-12-31"),
-    ]
+    df_1m = pd.concat([df_1m_2025, df_1m_2026], ignore_index=True).drop_duplicates('timestamp').sort_values('timestamp')
 
-    def run_for_ranges(allow_counter: bool) -> pd.DataFrame:
+    ranges_2025 = [("2025-01-01", "2025-12-31")]
+    ranges_2026 = [("2026-01-01", "2026-02-28")]
+
+    def run_for_ranges(allow_counter: bool, ranges) -> pd.DataFrame:
         all_trades = []
         for start_s, end_s in ranges:
             start = pd.Timestamp(start_s)
@@ -890,15 +888,20 @@ def main():
             all_trades.extend(run_engine(slice_1m, slice_30s, allow_counter_candle_entry=allow_counter))
         return pd.DataFrame([t.__dict__ for t in all_trades])
 
-    out_allow = run_for_ranges(True)
+    out_allow = run_for_ranges(True, ranges_2025)
     out_allow_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2025_allow_counter.csv"
     out_allow.to_csv(out_allow_path, index=False)
     print(f"Wrote {len(out_allow)} trades to {out_allow_path}")
 
-    out_no = run_for_ranges(False)
+    out_no = run_for_ranges(False, ranges_2025)
     out_no_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2025_no_counter.csv"
     out_no.to_csv(out_no_path, index=False)
     print(f"Wrote {len(out_no)} trades to {out_no_path}")
+
+    out_2026 = run_for_ranges(True, ranges_2026)
+    out_2026_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2026_janfeb.csv"
+    out_2026.to_csv(out_2026_path, index=False)
+    print(f"Wrote {len(out_2026)} trades to {out_2026_path}")
 
 
 if __name__ == "__main__":
