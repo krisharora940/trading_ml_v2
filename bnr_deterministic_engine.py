@@ -65,15 +65,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
     df_1m['day'] = df_1m['timestamp'].dt.date
     df_30s['day'] = df_30s['timestamp'].dt.date
 
-    # Load timing model (trained on 30s retrace bars, not entry-level features)
-    # Retrain with retrain_timing_model.py; tune threshold with analyze_thresholds.py
-    ENTRY_THRESH = 0.10   # P(this bar is the correct entry timing) — from retrain_timing_model.py
-    _entry_path  = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model.joblib"
-    _entry_bundle = joblib.load(_entry_path) if os.path.exists(_entry_path) else None
-    ml_model    = _entry_bundle['model']    if _entry_bundle else None
-    ml_features = _entry_bundle['features'] if _entry_bundle else None
-    ml_model_pwin   = None   # legacy — replaced by single timing model
-    ml_model_pvalid = None   # legacy — replaced by single timing model
+    # Load pwin model (P(net P&L > 0) — trained via retrain_pwin_from_backtest.py)
+    # Tune threshold with threshold sweep script
+    PWIN_THRESH  = 0.50   # above this, actual WR is consistently 70%+
+    _pwin_path   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin.joblib"
+    ml_model     = joblib.load(_pwin_path) if os.path.exists(_pwin_path) else None
+    ml_features  = ['retrace','pivot_flem_dist','time_since_pivot_sec','body_last',
+                    'body_sum','body_mean','in_dir_ratio','max_in_dir_run',
+                    'bars_since_pivot','zone_over_range','pivot_over_range']
 
     for day, day_1m in df_1m.groupby('day'):
         day_30s = df_30s[df_30s['day'] == day]
@@ -500,8 +499,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     'pivot_over_range': pivot_over_range
                                 }
                                 x = pd.DataFrame([features])[ml_features].fillna(0.0)
-                                timing_score = float(ml_model.predict_proba(x)[0][1])
-                                ml_allows_entry = timing_score >= ENTRY_THRESH
+                                pwin_score = float(ml_model.predict_proba(x)[0][1])
+                                ml_allows_entry = pwin_score >= PWIN_THRESH
 
                     # Displacement category based on zone/pivot distance over day range
                     day_key = t.date()
