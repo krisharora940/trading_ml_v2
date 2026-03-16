@@ -65,11 +65,18 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
     df_1m['day'] = df_1m['timestamp'].dt.date
     df_30s['day'] = df_30s['timestamp'].dt.date
 
-    # Load ML model for entry validation (if available)
-    model_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model.joblib"
-    ml_bundle = joblib.load(model_path) if os.path.exists(model_path) else None
-    ml_model = ml_bundle['model'] if ml_bundle else None
-    ml_features = ml_bundle['features'] if ml_bundle else None
+    # Load ML models for entry validation (pwin + pvalid dual-threshold)
+    PWIN_THRESH   = 0.45  # P(Net P&L > 0) minimum  — tune with analyze_thresholds.py
+    PVALID_THRESH = 0.45  # P(Setup Valid) minimum   — tune with analyze_thresholds.py
+    _pwin_path   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin.joblib"
+    _pvalid_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pvalid.joblib"
+    _entry_path  = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model.joblib"
+    ml_model_pwin   = joblib.load(_pwin_path)   if os.path.exists(_pwin_path)   else None
+    ml_model_pvalid = joblib.load(_pvalid_path) if os.path.exists(_pvalid_path) else None
+    # pwin/pvalid are raw XGBClassifier objects; entry_model.joblib is a dict with 'features'
+    _entry_bundle = joblib.load(_entry_path) if os.path.exists(_entry_path) else None
+    ml_features   = _entry_bundle['features'] if _entry_bundle else None
+    ml_model = ml_model_pwin  # fallback reference for legacy checks
 
     for day, day_1m in df_1m.groupby('day'):
         day_30s = df_30s[df_30s['day'] == day]
@@ -143,7 +150,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
         run_30s = 0
         last_body_30s = None
         last_30s_close = None
-        top2_scores = []
+        ml_allows_entry = False
 
         # For trades-in-progress
         in_trade = False
@@ -177,7 +184,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     run_30s = 0
                     last_body_30s = None
                     last_30s_close = None
-                    top2_scores = []
+                    ml_allows_entry = False
                     continue
                 if direction == 'short' and close > zone_high:
                     direction = None
@@ -194,7 +201,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     run_30s = 0
                     last_body_30s = None
                     last_30s_close = None
-                    top2_scores = []
+                    ml_allows_entry = False
                     continue
 
             # Update ML retrace window accumulators on 30s bars
@@ -250,7 +257,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     run_30s = 0
                     last_body_30s = None
                     last_30s_close = None
-                    top2_scores = []
+                    ml_allows_entry = False
 
                 elif candidate_active and direction == 'short' and close > zone_high:
                     if in_trade and trades and trades[-1].outcome is None:
@@ -282,7 +289,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                     run_30s = 0
                     last_body_30s = None
                     last_30s_close = None
-                    top2_scores = []
+                    ml_allows_entry = False
 
                 # Break detection if not active
                 if not candidate_active:
@@ -314,7 +321,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                             run_30s = 0
                             last_body_30s = None
                             last_30s_close = None
-                            top2_scores = []
+                            ml_allows_entry = False
                     else:
                         if flem is None or low < flem:
                             flem = low if flem is None else min(flem, low)
@@ -331,7 +338,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                             run_30s = 0
                             last_body_30s = None
                             last_30s_close = None
-                            top2_scores = []
+                            ml_allows_entry = False
 
                 # After reentry: update pivot until entry
                 if reentry_seen and not entry_triggered:
@@ -355,7 +362,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 run_30s = 0
                                 last_body_30s = None
                                 last_30s_close = None
-                                top2_scores = []
+                                ml_allows_entry = False
                                 continue
                         else:
                             retrace_reset = (pivot - close) / (pivot - flem)
@@ -375,7 +382,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 run_30s = 0
                                 last_body_30s = None
                                 last_30s_close = None
-                                top2_scores = []
+                                ml_allows_entry = False
                                 continue
                     # If retrace violates the far side of the zone before entry, invalidate candidate
                     if direction == 'long' and low < zone_low:
@@ -396,7 +403,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         run_30s = 0
                         last_body_30s = None
                         last_30s_close = None
-                        top2_scores = []
+                        ml_allows_entry = False
                         continue
                     if direction == 'short' and high > zone_high:
                         direction = None
@@ -416,7 +423,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         run_30s = 0
                         last_body_30s = None
                         last_30s_close = None
-                        top2_scores = []
+                        ml_allows_entry = False
                         continue
 
                     if direction == 'long':
@@ -496,10 +503,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     'pivot_over_range': pivot_over_range
                                 }
                                 x = pd.DataFrame([features])[ml_features].fillna(0.0)
-                                score = float(ml_model.predict_proba(x)[0][1])
-                                top2_scores.append(score)
-                                top2_scores = sorted(top2_scores, reverse=True)[:2]
-                                ml_allows_entry = score >= min(top2_scores) if len(top2_scores) == 2 else False
+                                pwin_score  = float(ml_model_pwin.predict_proba(x)[0][1])  if ml_model_pwin   else 1.0
+                                pvalid_score = float(ml_model_pvalid.predict_proba(x)[0][1]) if ml_model_pvalid else 1.0
+                                ml_allows_entry = pwin_score >= PWIN_THRESH and pvalid_score >= PVALID_THRESH
 
                     # Displacement category based on zone/pivot distance over day range
                     day_key = t.date()
@@ -859,8 +865,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
 
 
 def main():
-    p1 = "/Users/radhikaarora/Documents/New Project/Input Data/market/mnq_1m.csv"
-    p2 = "/Users/radhikaarora/Documents/New Project/Input Data/market/mnq_30s.csv"
+    p1 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_1m.csv"
+    p2 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_30s.csv"
 
     df_1m = pd.read_csv(p1)
     df_30s = pd.read_csv(p2)
