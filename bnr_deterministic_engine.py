@@ -67,7 +67,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
 
     # Load pwin model (P(net P&L > 0) — trained via retrain_pwin_from_backtest.py)
     # Tune threshold with threshold sweep script
-    PWIN_THRESH  = 0.55   # above this, actual WR is consistently 70%+
+    PWIN_THRESH  = 0.50   # above this, actual WR is consistently 70%+
     _pwin_path   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin.joblib"
     ml_model     = joblib.load(_pwin_path) if os.path.exists(_pwin_path) else None
     ml_features  = ['retrace','pivot_flem_dist','time_since_pivot_sec','body_last',
