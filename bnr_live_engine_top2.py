@@ -881,16 +881,16 @@ class BNRLiveEngine:
             if t.outcome is None:
                 continue  # skip open / incomplete trades
             out.append({
-                "Engine":     "bnr",
-                "Date":       str(t.day),
-                "Open Time":  t.entry_time.strftime("%H:%M:%S") if t.entry_time else "",
-                "Close Time": t.exit_time.strftime("%H:%M:%S")  if t.exit_time  else "",
-                "Side":       t.direction,
-                "Entry":      t.entry_price,
-                "Exit":       t.exit_price,
-                "Qty":        t.contracts,
-                "PnL ($)":    round((t.pnl or 0) * MNQ_DOLLARS_PER_POINT, 2),
-                "Reason":     t.exit_reason,
+                "Engine":       "bnr_top2",
+                "Date":         str(t.day),
+                "Open Time":    t.entry_time.strftime("%H:%M:%S") if t.entry_time else "",
+                "Close Time":   t.exit_time.strftime("%H:%M:%S")  if t.exit_time  else "",
+                "Side":         t.direction,
+                "Entry Price":  t.entry_price,
+                "Exit Price":   t.exit_price,
+                "Qty":          t.contracts,
+                "PnL ($)":      round((t.pnl or 0) * MNQ_DOLLARS_PER_POINT, 2),
+                "Exit Reason":  t.exit_reason,
             })
         return out
 

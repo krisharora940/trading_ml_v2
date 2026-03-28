@@ -4,7 +4,7 @@ BNR Live Trading Engine — 13-feature pwin model variant
 
 Identical to bnr_live_engine_pwin.py except:
   - Uses entry_model_pwin_13features.joblib (13 features including HOD/LOD)
-  - PWIN_THRESH = 0.60
+  - PWIN_THRESH = 0.50
   - Computes two additional features at entry time:
       dist_to_extrema_atr : (HOD - entry) / ATR  for long,  (entry - LOD) / ATR  for short
       zone_to_extrema_atr : (HOD - zone_high) / ATR  for long,  (zone_low - LOD) / ATR  for short
@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 # ─── constants ────────────────────────────────────────────────────────────────
 ET = pytz.timezone("America/New_York")
 MODEL_PATH   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin_13features.joblib"
-PWIN_THRESH  = 0.60
+PWIN_THRESH  = 0.50
 ML_FEATURES  = [
     'retrace', 'pivot_flem_dist', 'time_since_pivot_sec',
     'body_last', 'body_sum', 'body_mean', 'in_dir_ratio',
@@ -69,6 +69,7 @@ class LiveTrade:
     stop_price: Optional[float] = None
     retrace_at_entry: float = 0.0
     displacement: str = ''
+    pwin_score: float = 0.0
 
 
 # ─── rolling ATR (14-period Wilder smoothing) ─────────────────────────────────
@@ -103,7 +104,7 @@ class RollingATR:
 # ─── main engine ──────────────────────────────────────────────────────────────
 class BNRLiveEngine13:
     """
-    BNR live engine using 13-feature pwin model (PWIN_THRESH=0.60).
+    BNR live engine using 13-feature pwin model (PWIN_THRESH=0.50).
     Includes HOD/LOD distance features normalised by ATR.
     """
 
@@ -183,6 +184,16 @@ class BNRLiveEngine13:
         self._reentry_time = None
         self._flem = None
         self._flem_saved_time = None
+        self._pivot = None
+        self._pivot_time = None
+        self._entry_triggered = False
+        self._last_3_strong = []
+        self._reset_retrace_accumulators()
+
+    def _reset_after_close(self):
+        """After any trade close, reset pivot/reentry state but keep flem intact."""
+        self._reentry_seen = False
+        self._reentry_time = None
         self._pivot = None
         self._pivot_time = None
         self._entry_triggered = False
@@ -352,6 +363,7 @@ class BNRLiveEngine13:
         self._in_trade = False
         self._scale_out_active = False
         self._scale_out_stage = 0
+        self._reset_after_close()
 
     # ── on_bar_30s ────────────────────────────────────────────────────────────
 
@@ -643,6 +655,15 @@ class BNRLiveEngine13:
                         q = contracts // 4
                         rem = contracts - 3 * q
                         self._scale_out_plan = [(q, 1.2), (q, 2.5), (q, 4.0), (rem, 6.5)]
+                    elif contracts == 1:
+                        # Single contract: no scale-out
+                        self._scale_out_plan = []
+                    elif contracts == 2:
+                        # Two contracts: scale at 1.5R and 3.0R
+                        self._scale_out_plan = [(1, 1.5), (1, 3.0)]
+                    elif contracts == 3:
+                        # Three contracts: 1 @ 1.2R, 1 @ 2.0R, 1 @ 3.0R
+                        self._scale_out_plan = [(1, 1.2), (1, 2.0), (1, 3.0)]
                     else:
                         q1 = contracts // 4
                         q2 = int(contracts * 0.35)
@@ -671,6 +692,7 @@ class BNRLiveEngine13:
                         target=float(target),
                         retrace_at_entry=float(retrace),
                         displacement=disp,
+                        pwin_score=float(score) if score is not None else 0.0,
                     )
                     self._trades.append(trade)
 
@@ -811,7 +833,7 @@ class BNRLiveEngine13:
             'day', 'direction', 'entry_time', 'entry_price', 'exit_time', 'exit_price',
             'pnl', 'contracts', 'risk_dollars', 'outcome', 'exit_reason',
             'pivot', 'flem', 'reentry_time', 'pivot_time', 'risk', 'target',
-            'stop_price', 'retrace_at_entry', 'displacement',
+            'stop_price', 'retrace_at_entry', 'displacement', 'pwin_score',
         ]
         with open(path, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=fields)
@@ -836,6 +858,7 @@ class BNRLiveEngine13:
                 "Qty":         t.contracts,
                 "PnL ($)":     round((t.pnl or 0) * MNQ_DOLLARS_PER_POINT, 2),
                 "Exit Reason": t.exit_reason,
+                "pwin_score":  round(t.pwin_score, 4),
             })
         return out
 

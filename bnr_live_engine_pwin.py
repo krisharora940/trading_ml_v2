@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 # ─── constants ────────────────────────────────────────────────────────────────
 ET = pytz.timezone("America/New_York")
 MODEL_PATH   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin.joblib"
-PWIN_THRESH  = 0.55
+PWIN_THRESH  = 0.50
 ML_FEATURES  = [
     'retrace', 'pivot_flem_dist', 'time_since_pivot_sec',
     'body_last', 'body_sum', 'body_mean', 'in_dir_ratio',
@@ -206,6 +206,18 @@ class BNRLiveEngine:
         self._last_3_strong = []
         self._reset_retrace_accumulators()
 
+    def _reset_after_close(self):
+        """After any trade close, reset pivot/reentry state but keep flem intact.
+        This allows a new retest/pivot to form before re-entering the same setup.
+        """
+        self._reentry_seen = False
+        self._reentry_time = None
+        self._pivot = None
+        self._pivot_time = None
+        self._entry_triggered = False
+        self._last_3_strong = []
+        self._reset_retrace_accumulators()
+
     def _reset_retrace_accumulators(self):
         self._body_sum_30s = 0.0
         self._body_count_30s = 0
@@ -361,6 +373,7 @@ class BNRLiveEngine:
         self._in_trade = False
         self._scale_out_active = False
         self._scale_out_stage = 0
+        self._reset_after_close()
 
     # ── on_bar_30s ────────────────────────────────────────────────────────────
 
@@ -678,6 +691,15 @@ class BNRLiveEngine:
                         q = contracts // 4
                         rem = contracts - 3 * q
                         self._scale_out_plan = [(q, 1.2), (q, 2.5), (q, 4.0), (rem, 6.5)]
+                    elif contracts == 1:
+                        # Single contract: no scale-out
+                        self._scale_out_plan = []
+                    elif contracts == 2:
+                        # Two contracts: scale at 1.5R and 3.0R
+                        self._scale_out_plan = [(1, 1.5), (1, 3.0)]
+                    elif contracts == 3:
+                        # Three contracts: 1 @ 1.2R, 1 @ 2.0R, 1 @ 3.0R
+                        self._scale_out_plan = [(1, 1.2), (1, 2.0), (1, 3.0)]
                     else:
                         q1 = contracts // 4
                         q2 = int(contracts * 0.35)
@@ -880,16 +902,16 @@ class BNRLiveEngine:
             if t.outcome is None:
                 continue  # skip open / incomplete trades
             out.append({
-                "Engine":     "bnr",
-                "Date":       str(t.day),
-                "Open Time":  t.entry_time.strftime("%H:%M:%S") if t.entry_time else "",
-                "Close Time": t.exit_time.strftime("%H:%M:%S")  if t.exit_time  else "",
-                "Side":       t.direction,
-                "Entry":      t.entry_price,
-                "Exit":       t.exit_price,
-                "Qty":        t.contracts,
-                "PnL ($)":    round((t.pnl or 0) * MNQ_DOLLARS_PER_POINT, 2),
-                "Reason":     t.exit_reason,
+                "Engine":       "bnr_pwin",
+                "Date":         str(t.day),
+                "Open Time":    t.entry_time.strftime("%H:%M:%S") if t.entry_time else "",
+                "Close Time":   t.exit_time.strftime("%H:%M:%S")  if t.exit_time  else "",
+                "Side":         t.direction,
+                "Entry Price":  t.entry_price,
+                "Exit Price":   t.exit_price,
+                "Qty":          t.contracts,
+                "PnL ($)":      round((t.pnl or 0) * MNQ_DOLLARS_PER_POINT, 2),
+                "Exit Reason":  t.exit_reason,
             })
         return out
 

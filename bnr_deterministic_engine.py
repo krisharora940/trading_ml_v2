@@ -70,9 +70,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
     PWIN_THRESH  = 0.50   # above this, actual WR is consistently 70%+
     _pwin_path   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin.joblib"
     ml_model     = joblib.load(_pwin_path) if os.path.exists(_pwin_path) else None
-    ml_features  = ['retrace','pivot_flem_dist','time_since_pivot_sec','body_last',
-                    'body_sum','body_mean','in_dir_ratio','max_in_dir_run',
-                    'bars_since_pivot','zone_over_range','pivot_over_range']
+    ml_features  = ['retrace','pivot_flem_dist','time_since_pivot_sec','body_last','body_sum','body_mean','in_dir_ratio','max_in_dir_run','bars_since_pivot','zone_over_range','pivot_over_range']
 
     for day, day_1m in df_1m.groupby('day'):
         day_30s = df_30s[df_30s['day'] == day]
@@ -467,6 +465,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                             if retrace_ml is not None:
                                 body_mean = body_sum_30s / body_count_30s
                                 in_dir_ratio = in_dir_count_30s / body_count_30s
+                                atr_val = float(atr) if atr is not None else 0.0
                                 # 9:30 zone and day range for zone/pivot over range features
                                 day_key = t.date()
                                 zone_time = pd.Timestamp(f"{day_key} 09:30:00", tz=day_1m['timestamp'].dt.tz)
@@ -485,6 +484,17 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 zone_over_range = (dist_zone / day_range) if (dist_zone is not None and day_range not in (0.0, None)) else 0.0
                                 pivot_over_range = (pivot_flem_dist / day_range) if (day_range not in (0.0, None)) else 0.0
 
+                                # HOD/LOD features (current point in day)
+                                hod_now = float(day_1m_to_now['high'].max()) if not day_1m_to_now.empty else last_30s_close
+                                lod_now = float(day_1m_to_now['low'].min())  if not day_1m_to_now.empty else last_30s_close
+                                entry_price_est = last_30s_close
+                                if direction == 'long':
+                                    dist_to_extrema_atr  = (hod_now - entry_price_est) / atr_val if atr_val else 0.0
+                                    zone_to_extrema_atr  = (hod_now - zone_price) / atr_val if (zone_price and atr_val) else 0.0
+                                else:
+                                    dist_to_extrema_atr  = (entry_price_est - lod_now) / atr_val if atr_val else 0.0
+                                    zone_to_extrema_atr  = (zone_price - lod_now) / atr_val if (zone_price and atr_val) else 0.0
+
                                 features = {
                                     'retrace': retrace_ml,
                                     'pivot_flem_dist': pivot_flem_dist,
@@ -496,7 +506,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     'max_in_dir_run': max_run_30s,
                                     'bars_since_pivot': body_count_30s,
                                     'zone_over_range': zone_over_range,
-                                    'pivot_over_range': pivot_over_range
+                                    'pivot_over_range': pivot_over_range,
+                                    'dist_to_extrema_atr': dist_to_extrema_atr,
+                                    'zone_to_extrema_atr': zone_to_extrema_atr,
                                 }
                                 x = pd.DataFrame([features])[ml_features].fillna(0.0)
                                 pwin_score = float(ml_model.predict_proba(x)[0][1])
@@ -634,8 +646,6 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         elapsed = t - current.entry_time
 
                         # If trade has run at least 30 minutes:
-                        # - if above BE, move stop to BE
-                        # - if below BE, move target to BE
                         if elapsed >= pd.Timedelta(minutes=30):
                             if direction == 'long':
                                 if close > entry_price:
@@ -672,6 +682,13 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 daily_pnl_dollars += float(current.pnl) * 2.0
                                 scale_out_active = False
                                 scale_out_stage = 0
+                                # Reset setup after close (keep flem for re-entry)
+                                entry_triggered = False
+                                reentry_seen = False
+                                pivot = None
+                                pivot_time = None
+                                reentry_time = None
+                                last_3_strong = []
                             elif high >= target_price:
                                 if scale_out_active and scale_out_stage < len(scale_out_plan) - 1:
                                     # Intermediate scale-out leg (long)
@@ -747,6 +764,13 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     daily_pnl_dollars += float(current.pnl) * 2.0
                                     scale_out_active = False
                                     scale_out_stage = 0
+                                    # Reset setup after close (keep flem for re-entry)
+                                    entry_triggered = False
+                                    reentry_seen = False
+                                    pivot = None
+                                    pivot_time = None
+                                    reentry_time = None
+                                    last_3_strong = []
                         else:
                             # Stop is based on 1m close above pivot
                             if close >= stop_price:
@@ -761,6 +785,13 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 daily_pnl_dollars += float(current.pnl) * 2.0
                                 scale_out_active = False
                                 scale_out_stage = 0
+                                # Reset setup after close (keep flem for re-entry)
+                                entry_triggered = False
+                                reentry_seen = False
+                                pivot = None
+                                pivot_time = None
+                                reentry_time = None
+                                last_3_strong = []
                             elif low <= target_price:
                                 if scale_out_active and scale_out_stage < len(scale_out_plan) - 1:
                                     # Intermediate scale-out leg (short)
@@ -836,6 +867,13 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     daily_pnl_dollars += float(current.pnl) * 2.0
                                     scale_out_active = False
                                     scale_out_stage = 0
+                                    # Reset setup after close (keep flem for re-entry)
+                                    entry_triggered = False
+                                    reentry_seen = False
+                                    pivot = None
+                                    pivot_time = None
+                                    reentry_time = None
+                                    last_3_strong = []
 
         # End of day cleanup: force-close any unclosed trade at session end
         if trades and trades[-1].outcome is None:
@@ -863,19 +901,25 @@ def main():
     p1_2025 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_1m.csv"
     p2_full = "/Users/radhikaarora/Documents/New Project/output/market/mnq_30s_full.csv"
     p1_2026 = "/Users/radhikaarora/Documents/New Project/Input Data/market/mnq_1m_jan_feb_2026.csv"
+    p1_mar26 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_1m_mar26.csv"
+    p30s_mar26 = "/Users/radhikaarora/Documents/New Project/output/market/mnq_30s_mar26.csv"
 
     df_1m_2025 = pd.read_csv(p1_2025)
     df_30s     = pd.read_csv(p2_full)
     df_1m_2026 = pd.read_csv(p1_2026)
+    df_1m_mar26 = pd.read_csv(p1_mar26)
+    df_30s_mar26 = pd.read_csv(p30s_mar26)
 
     # Parse timestamps
-    for df in (df_1m_2025, df_30s, df_1m_2026):
+    for df in (df_1m_2025, df_30s, df_1m_2026, df_1m_mar26, df_30s_mar26):
         df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert("America/New_York")
 
-    df_1m = pd.concat([df_1m_2025, df_1m_2026], ignore_index=True).drop_duplicates('timestamp').sort_values('timestamp')
+    df_1m = pd.concat([df_1m_2025, df_1m_2026, df_1m_mar26], ignore_index=True).drop_duplicates('timestamp').sort_values('timestamp')
+    df_30s_all = pd.concat([df_30s, df_30s_mar26], ignore_index=True).drop_duplicates('timestamp').sort_values('timestamp')
 
     ranges_2025 = [("2025-01-01", "2025-12-31")]
     ranges_2026 = [("2026-01-01", "2026-02-28")]
+    ranges_mar26 = [("2026-03-01", "2026-03-31")]
 
     def run_for_ranges(allow_counter: bool, ranges) -> pd.DataFrame:
         all_trades = []
@@ -883,7 +927,7 @@ def main():
             start = pd.Timestamp(start_s)
             end = pd.Timestamp(end_s)
             slice_1m = df_1m[(df_1m['timestamp'].dt.date >= start.date()) & (df_1m['timestamp'].dt.date <= end.date())]
-            slice_30s = df_30s[(df_30s['timestamp'].dt.date >= start.date()) & (df_30s['timestamp'].dt.date <= end.date())]
+            slice_30s = df_30s_all[(df_30s_all['timestamp'].dt.date >= start.date()) & (df_30s_all['timestamp'].dt.date <= end.date())]
             all_trades.extend(run_engine(slice_1m, slice_30s, allow_counter_candle_entry=allow_counter))
         return pd.DataFrame([t.__dict__ for t in all_trades])
 
@@ -901,6 +945,11 @@ def main():
     out_2026_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2026_janfeb.csv"
     out_2026.to_csv(out_2026_path, index=False)
     print(f"Wrote {len(out_2026)} trades to {out_2026_path}")
+
+    out_mar26 = run_for_ranges(True, ranges_mar26)
+    out_mar26_path = "/Users/radhikaarora/Documents/Trading ML/ML V2/output_bnr_det_2026_mar.csv"
+    out_mar26.to_csv(out_mar26_path, index=False)
+    print(f"Wrote {len(out_mar26)} trades to {out_mar26_path}")
 
 
 if __name__ == "__main__":
