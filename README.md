@@ -53,24 +53,6 @@ Important files in that branch include:
 - `data/`: locally fetched supporting data, including Databento parquet files
 - `baselines/`: baseline engine copies
 
-## External Data Dependencies
-
-This repo reads market data from local absolute paths outside the repo.
-
-Common roots used in current scripts:
-- `/Users/radhikaarora/Documents/New Project/output/market/quarterly`
-- `/Users/radhikaarora/Documents/New Project/Input Data/market`
-- `/Users/radhikaarora/Documents/New Project/output/market`
-
-Examples:
-- quarterly 2025 `1m` / `30s` CSVs
-- `mnq_1m_jan_feb_2026.csv`
-- `mnq_1m_mar26.csv`
-- `mnq_30s_mar26.csv`
-- `data/mnq_30s_2026-01-01_to_2026-02-28.parquet`
-
-The repo does not currently normalize these paths through a config layer. Most scripts hardcode them.
-
 ## Model Artifacts
 
 Model files are local `.joblib` artifacts in repo root, for example:
