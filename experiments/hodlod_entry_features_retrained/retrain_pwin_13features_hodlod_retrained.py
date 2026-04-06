@@ -12,6 +12,7 @@ Label: outcome == 'win'  →  label_win = 1
 """
 
 import os
+import argparse
 import numpy as np
 import pandas as pd
 import joblib
@@ -24,21 +25,33 @@ from sklearn.calibration import CalibratedClassifierCV
 BASE      = "/Users/radhikaarora/Documents/Trading ML/ML V2"
 DATA_DIR  = "/Users/radhikaarora/Documents/New Project/output/market/quarterly"
 
-BACKTEST_CSV = os.path.join(BASE, "output_bnr_det_2025_allow_counter.csv")
-BARS_30S_Q   = [
+DEFAULT_BACKTEST_CSV = os.path.join(BASE, "output_bnr_det_2025_allow_counter.csv")
+DEFAULT_BARS_30S_Q   = [
     os.path.join(DATA_DIR, "mnq_30s_2025_q1.csv"),
     os.path.join(DATA_DIR, "mnq_30s_2025_q2.csv"),
     os.path.join(DATA_DIR, "mnq_30s_2025_q3.csv"),
     os.path.join(DATA_DIR, "mnq_30s_2025_q4.csv"),
 ]
-BARS_1M_Q    = [
+DEFAULT_BARS_1M_Q    = [
     os.path.join(DATA_DIR, "mnq_1m_2025_q1.csv"),
     os.path.join(DATA_DIR, "mnq_1m_2025_q2.csv"),
     os.path.join(DATA_DIR, "mnq_1m_2025_q3.csv"),
     os.path.join(DATA_DIR, "mnq_1m_2025_q4.csv"),
 ]
-OUT_MODEL    = os.path.join(BASE, "entry_model_pwin_13features_retrained_hodlod_entry_retrainedset.joblib")
-OUT_CSV      = os.path.join(BASE, "ml_features_13feat_retrain_hodlod_entry_retrainedset.csv")
+DEFAULT_OUT_MODEL    = os.path.join(BASE, "entry_model_pwin_13features_retrained_hodlod_entry_retrainedset.joblib")
+DEFAULT_OUT_CSV      = os.path.join(BASE, "ml_features_13feat_retrain_hodlod_entry_retrainedset.csv")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Retrain pwin model (HOD/LOD retrained set).")
+    p.add_argument("--backtest-csv", default=DEFAULT_BACKTEST_CSV)
+    p.add_argument("--bars-30s", nargs="*", default=DEFAULT_BARS_30S_Q)
+    p.add_argument("--bars-1m", nargs="*", default=DEFAULT_BARS_1M_Q)
+    p.add_argument("--out-model", default=DEFAULT_OUT_MODEL)
+    p.add_argument("--out-csv", default=DEFAULT_OUT_CSV)
+    p.add_argument("--exclude-month", default="", help="Exclude YYYY-MM from training.")
+    p.add_argument("--base-features-csv", default="", help="Optional existing feature matrix to append before training.")
+    return p.parse_args()
 
 ML_FEATURES = [
     "retrace", "pivot_flem_dist", "time_since_pivot_sec",
@@ -52,19 +65,21 @@ ML_FEATURES = [
 ET = "America/New_York"
 
 # ── Load raw data ────────────────────────────────────────────────────────────
+args = parse_args()
+
 print("Loading 30s bars …")
-bars30 = pd.concat([pd.read_csv(p, parse_dates=['timestamp']) for p in BARS_30S_Q], ignore_index=True)
+bars30 = pd.concat([pd.read_csv(p, parse_dates=['timestamp']) for p in args.bars_30s], ignore_index=True)
 bars30['timestamp'] = pd.to_datetime(bars30['timestamp'], utc=True).dt.tz_convert(ET)
 bars30 = bars30.sort_values('timestamp').reset_index(drop=True)
 print(f"  {len(bars30)} rows  {bars30['timestamp'].min()} → {bars30['timestamp'].max()}")
 
 print("Loading 1m bars …")
-bars1m = pd.concat([pd.read_csv(p, parse_dates=['timestamp']) for p in BARS_1M_Q], ignore_index=True)
+bars1m = pd.concat([pd.read_csv(p, parse_dates=['timestamp']) for p in args.bars_1m], ignore_index=True)
 bars1m['timestamp'] = pd.to_datetime(bars1m['timestamp'], utc=True).dt.tz_convert(ET)
 bars1m = bars1m.sort_values('timestamp').reset_index(drop=True)
 
 print("Loading backtest output …")
-bt = pd.read_csv(BACKTEST_CSV)
+bt = pd.read_csv(args.backtest_csv)
 
 # Parse timestamps
 for col in ['entry_time','pivot_time','flem_saved_time']:
@@ -75,6 +90,9 @@ bt['day'] = pd.to_datetime(bt['day']).dt.date
 
 # Deduplicate: keep first row per (day, direction, entry_time)
 bt_u = bt.drop_duplicates(subset=['day','direction','entry_time']).copy()
+if args.exclude_month:
+    bt_u = bt_u[bt_u["entry_time"].dt.to_period("M").astype(str) != args.exclude_month].copy()
+    print(f"  Excluded month {args.exclude_month} → {len(bt_u)} trades remain")
 print(f"  {len(bt)} raw rows → {len(bt_u)} unique trades")
 print(f"  Win/loss: {bt_u['outcome'].value_counts().to_dict()}")
 
@@ -212,13 +230,33 @@ feat_df = pd.DataFrame(rows)
 print(f"  Reconstructed {len(feat_df)} trades  |  skipped {skipped}")
 print(f"  label_win: {feat_df['label_win'].value_counts().to_dict()}")
 print(f"  Win rate: {feat_df['label_win'].mean():.3f}")
-feat_df.to_csv(OUT_CSV, index=False)
-print(f"  Saved feature matrix → {OUT_CSV}")
+
+train_df = feat_df
+if args.base_features_csv:
+    print("\nMerging with base feature matrix …")
+    base_df = pd.read_csv(args.base_features_csv)
+    if args.exclude_month and "entry_time" in base_df.columns:
+        base_df["entry_time"] = pd.to_datetime(base_df["entry_time"], utc=True).dt.tz_convert(ET)
+        base_df = base_df[base_df["entry_time"].dt.to_period("M").astype(str) != args.exclude_month].copy()
+        base_df["entry_time"] = base_df["entry_time"].astype(str)
+    before_merge = len(feat_df)
+    train_df = pd.concat([base_df, feat_df], ignore_index=True)
+    merged_before_dedup = len(train_df)
+    dedupe_cols = [c for c in ["open_date", "direction", "entry_time", "pivot_time"] if c in train_df.columns]
+    if dedupe_cols:
+        train_df = train_df.drop_duplicates(subset=dedupe_cols)
+    print(f"  base rows: {len(base_df)}")
+    print(f"  new rows:  {before_merge}")
+    print(f"  merged rows (pre-dedup): {merged_before_dedup}")
+    print(f"  merged rows (deduped):   {len(train_df)}")
+
+train_df.to_csv(args.out_csv, index=False)
+print(f"  Saved feature matrix → {args.out_csv}")
 
 # ── Train ────────────────────────────────────────────────────────────────────
 print("\nTraining pwin model …")
-X = feat_df[ML_FEATURES].fillna(0.0).values
-y = feat_df['label_win'].astype(int).values
+X = train_df[ML_FEATURES].fillna(0.0).values
+y = train_df['label_win'].astype(int).values
 
 n_pos = y.sum()
 n_neg = (y == 0).sum()
@@ -266,10 +304,10 @@ print(f"  Losses: mean={loss_p.mean():.4f}  median={np.median(loss_p):.4f}")
 print("\n── Threshold sweep ──")
 print(f"  {'thresh':>7}  {'trades':>7}  {'WR':>6}  {'coverage':>9}")
 thresholds = np.round(np.arange(0.35, 0.75, 0.05), 2)
-feat_df['prob'] = probs
-total = len(feat_df)
+train_df['prob'] = probs
+total = len(train_df)
 for t in thresholds:
-    sub = feat_df[feat_df['prob'] >= t]
+    sub = train_df[train_df['prob'] >= t]
     n   = len(sub)
     wr  = sub['label_win'].mean() if n > 0 else 0
     cov = n / total
@@ -287,7 +325,7 @@ except Exception as e:
     print(f"  (could not extract importances: {e})")
 
 # ── Save ─────────────────────────────────────────────────────────────────────
-print(f"\nSaving to {OUT_MODEL} …")
-joblib.dump(cal, OUT_MODEL)
+print(f"\nSaving to {args.out_model} …")
+joblib.dump(cal, args.out_model)
 print("Done.")
 print(f"\nNext step: re-run backtest and compare vs top-2 baseline (278 trades, 50.7% WR)")

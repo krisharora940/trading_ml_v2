@@ -34,6 +34,8 @@ class Trade:
     strong_count_recent3: int
     very_strong: bool
     pwin_score: float = 0.0
+    raw_pnl: Optional[float] = None
+    phantom_trade: bool = False
 
 
 def compute_atr(df_1m: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -55,6 +57,10 @@ MAX_CONTRACTS = 250
 SLIPPAGE_TICKS = 1
 TICK_SIZE = 0.25
 MIN_RISK_PTS = 500.0 / (MAX_CONTRACTS * 2.0)  # $500 max risk, MNQ = $2/pt
+SIZE_GATE_CONTRACTS = 20
+SIZE_GATE_PWIN_THRESH = 0.50
+SIZE_GATE2_CONTRACTS = 35
+SIZE_GATE2_PWIN_THRESH = 0.60
 
 def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_entry: bool, pwin_thresh: float = PWIN_THRESH_DEFAULT) -> List[Trade]:
     trades: List[Trade] = []
@@ -75,7 +81,10 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
     # Load pwin model (P(net P&L > 0) — trained via retrain_pwin_from_backtest.py)
     # Tune threshold with threshold sweep script
     PWIN_THRESH  = pwin_thresh
-    _pwin_path   = "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin_13features_retrained_hodlod_entry_retrainedset.joblib"
+    _pwin_path   = os.environ.get(
+        "PWIN_MODEL_PATH",
+        "/Users/radhikaarora/Documents/Trading ML/ML V2/entry_model_pwin_13features_retrained_hodlod_entry_retrainedset.joblib",
+    )
     ml_model     = joblib.load(_pwin_path) if os.path.exists(_pwin_path) else None
     ml_features  = ['retrace','pivot_flem_dist','time_since_pivot_sec','body_last','body_sum','body_mean','in_dir_ratio','max_in_dir_run','bars_since_pivot','zone_over_range','pivot_over_range','dist_to_extrema_atr','zone_to_extrema_atr','hod_rel_entry_atr','lod_rel_entry_atr']
 
@@ -163,6 +172,10 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
         scale_out_plan = []   # [(contracts, target_R), ...] — one entry per leg
         daily_pnl_dollars = 0.0
 
+        def finalize_trade_pnl(trade: Trade, raw_pnl: float) -> None:
+            trade.raw_pnl = float(raw_pnl)
+            trade.pnl = 0.0 if trade.phantom_trade else float(raw_pnl)
+
         for _, ev in events.iterrows():
             t = ev['event_time']
             if t < zone_known_time:
@@ -237,7 +250,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         current.exit_price = float(close)
                         current.stop_time = t
                         current.stop_price = float(stop_price) if stop_price is not None else None
-                        current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
+                        finalize_trade_pnl(current, float(current.exit_price - current.entry_price) * float(current.contracts or 0))
                         current.exit_reason = 'direction_flip'
                         in_trade = False
                         daily_pnl_dollars += float(current.pnl) * 2.0
@@ -269,7 +282,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                         current.exit_price = float(close)
                         current.stop_time = t
                         current.stop_price = float(stop_price) if stop_price is not None else None
-                        current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
+                        finalize_trade_pnl(current, float(current.entry_price - current.exit_price) * float(current.contracts or 0))
                         current.exit_reason = 'direction_flip'
                         in_trade = False
                         daily_pnl_dollars += float(current.pnl) * 2.0
@@ -573,6 +586,14 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 stop_price = None
                                 target_price = None
                                 continue
+                            phantom_trade = False
+                            if ml_model is not None:
+                                min_required_pwin = PWIN_THRESH
+                                if contracts >= SIZE_GATE_CONTRACTS:
+                                    min_required_pwin = max(min_required_pwin, SIZE_GATE_PWIN_THRESH)
+                                if contracts > SIZE_GATE2_CONTRACTS:
+                                    min_required_pwin = max(min_required_pwin, SIZE_GATE2_PWIN_THRESH)
+                                phantom_trade = pwin_score < min_required_pwin
 
                             # Scale-out plan:
                             #   contracts >= 13 => 25% at 1.2R, 25% at 2.5R, 25% at 4R, 25% at 6.5R
@@ -612,7 +633,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 retrace_at_entry=float(retrace),
                                 strong_count_recent3=strong_count,
                                 very_strong=bool(very_strong),
-                                pwin_score=pwin_score if ml_model is not None else 0.0
+                                pwin_score=pwin_score if ml_model is not None else 0.0,
+                                raw_pnl=None,
+                                phantom_trade=phantom_trade,
                             ))
             # Manage trade (stop/target) using 1m bars
             if in_trade and trades:
@@ -628,7 +651,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 current.outcome = 'loss'
                                 current.exit_time = t
                                 current.exit_price = float(close - (SLIPPAGE_TICKS * TICK_SIZE))
-                                current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
+                                finalize_trade_pnl(current, float(current.exit_price - current.entry_price) * float(current.contracts or 0))
                                 current.stop_time = t
                                 current.stop_price = float(stop_price)
                                 current.exit_reason = 'stop'
@@ -658,7 +681,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         entry_price=current.entry_price,
                                         exit_time=leg_exit_time,
                                         exit_price=leg_exit_price,
-                                        pnl=float(leg_exit_price - current.entry_price) * float(leg_q),
+                                        pnl=None,
                                         contracts=leg_q,
                                         risk_dollars=float(current.risk * 2.0 * leg_q),
                                         outcome='win',
@@ -675,12 +698,16 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         retrace_at_entry=current.retrace_at_entry,
                                         strong_count_recent3=current.strong_count_recent3,
                                         very_strong=current.very_strong,
-                                        pwin_score=current.pwin_score
+                                        pwin_score=current.pwin_score,
+                                        raw_pnl=None,
+                                        phantom_trade=current.phantom_trade,
                                     )
+                                    finalize_trade_pnl(leg_trade, float(leg_exit_price - current.entry_price) * float(leg_q))
                                     trades[-1] = leg_trade
                                     daily_pnl_dollars += float(leg_trade.pnl) * 2.0
                                     scale_out_stage += 1
                                     target_price = current.entry_price + next_r * current.risk
+                                    remaining_qty = sum(q for q, _ in scale_out_plan[scale_out_stage:])
                                     remaining_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
@@ -689,8 +716,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         exit_time=None,
                                         exit_price=None,
                                         pnl=None,
-                                        contracts=next_q,
-                                        risk_dollars=float(current.risk * 2.0 * next_q),
+                                        contracts=remaining_qty,
+                                        risk_dollars=float(current.risk * 2.0 * remaining_qty),
                                         outcome=None,
                                         exit_reason=None,
                                         pivot=current.pivot,
@@ -705,7 +732,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         retrace_at_entry=current.retrace_at_entry,
                                         strong_count_recent3=current.strong_count_recent3,
                                         very_strong=current.very_strong,
-                                        pwin_score=current.pwin_score
+                                        pwin_score=current.pwin_score,
+                                        raw_pnl=None,
+                                        phantom_trade=current.phantom_trade,
                                     )
                                     trades.append(remaining_trade)
                                     in_trade = True
@@ -715,7 +744,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
                                     current.exit_time = hit_time if hit_time is not None else t
                                     current.exit_price = float(target_price - (SLIPPAGE_TICKS * TICK_SIZE))
-                                    current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
+                                    finalize_trade_pnl(current, float(current.exit_price - current.entry_price) * float(current.contracts or 0))
                                     current.exit_reason = 'target'
                                     in_trade = False
                                     daily_pnl_dollars += float(current.pnl) * 2.0
@@ -734,7 +763,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                 current.outcome = 'loss'
                                 current.exit_time = t
                                 current.exit_price = float(close + (SLIPPAGE_TICKS * TICK_SIZE))
-                                current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
+                                finalize_trade_pnl(current, float(current.entry_price - current.exit_price) * float(current.contracts or 0))
                                 current.stop_time = t
                                 current.stop_price = float(stop_price)
                                 current.exit_reason = 'stop'
@@ -764,7 +793,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         entry_price=current.entry_price,
                                         exit_time=leg_exit_time,
                                         exit_price=leg_exit_price,
-                                        pnl=float(current.entry_price - leg_exit_price) * float(leg_q),
+                                        pnl=None,
                                         contracts=leg_q,
                                         risk_dollars=float(current.risk * 2.0 * leg_q),
                                         outcome='win',
@@ -781,12 +810,16 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         retrace_at_entry=current.retrace_at_entry,
                                         strong_count_recent3=current.strong_count_recent3,
                                         very_strong=current.very_strong,
-                                        pwin_score=current.pwin_score
+                                        pwin_score=current.pwin_score,
+                                        raw_pnl=None,
+                                        phantom_trade=current.phantom_trade,
                                     )
+                                    finalize_trade_pnl(leg_trade, float(current.entry_price - leg_exit_price) * float(leg_q))
                                     trades[-1] = leg_trade
                                     daily_pnl_dollars += float(leg_trade.pnl) * 2.0
                                     scale_out_stage += 1
                                     target_price = current.entry_price - next_r * current.risk
+                                    remaining_qty = sum(q for q, _ in scale_out_plan[scale_out_stage:])
                                     remaining_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
@@ -795,8 +828,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         exit_time=None,
                                         exit_price=None,
                                         pnl=None,
-                                        contracts=next_q,
-                                        risk_dollars=float(current.risk * 2.0 * next_q),
+                                        contracts=remaining_qty,
+                                        risk_dollars=float(current.risk * 2.0 * remaining_qty),
                                         outcome=None,
                                         exit_reason=None,
                                         pivot=current.pivot,
@@ -811,7 +844,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         retrace_at_entry=current.retrace_at_entry,
                                         strong_count_recent3=current.strong_count_recent3,
                                         very_strong=current.very_strong,
-                                        pwin_score=current.pwin_score
+                                        pwin_score=current.pwin_score,
+                                        raw_pnl=None,
+                                        phantom_trade=current.phantom_trade,
                                     )
                                     trades.append(remaining_trade)
                                     in_trade = True
@@ -821,7 +856,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     hit_time = first_30s_target_hit(ev['timestamp'], direction, target_price)
                                     current.exit_time = hit_time if hit_time is not None else t
                                     current.exit_price = float(target_price + (SLIPPAGE_TICKS * TICK_SIZE))
-                                    current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
+                                    finalize_trade_pnl(current, float(current.entry_price - current.exit_price) * float(current.contracts or 0))
                                     current.exit_reason = 'target'
                                     in_trade = False
                                     daily_pnl_dollars += float(current.pnl) * 2.0
@@ -848,9 +883,9 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
             else:
                 current.exit_price = close + (SLIPPAGE_TICKS * TICK_SIZE)
             if current.direction == 'long':
-                current.pnl = float(current.exit_price - current.entry_price) * float(current.contracts or 0)
+                finalize_trade_pnl(current, float(current.exit_price - current.entry_price) * float(current.contracts or 0))
             else:
-                current.pnl = float(current.entry_price - current.exit_price) * float(current.contracts or 0)
+                finalize_trade_pnl(current, float(current.entry_price - current.exit_price) * float(current.contracts or 0))
             current.exit_reason = 'forced_close'
             in_trade = False
             daily_pnl_dollars += float(current.pnl) * 2.0

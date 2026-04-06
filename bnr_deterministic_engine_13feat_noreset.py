@@ -696,6 +696,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     daily_pnl_dollars += float(leg_trade.pnl) * 2.0
                                     scale_out_stage += 1
                                     target_price = current.entry_price + next_r * current.risk
+                                    remaining_qty = sum(q for q, _ in scale_out_plan[scale_out_stage:])
                                     remaining_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
@@ -704,8 +705,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         exit_time=None,
                                         exit_price=None,
                                         pnl=None,
-                                        contracts=next_q,
-                                        risk_dollars=float(current.risk * 2.0 * next_q),
+                                        contracts=remaining_qty,
+                                        risk_dollars=float(current.risk * 2.0 * remaining_qty),
                                         outcome=None,
                                         exit_reason=None,
                                         pivot=current.pivot,
@@ -791,6 +792,7 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                     daily_pnl_dollars += float(leg_trade.pnl) * 2.0
                                     scale_out_stage += 1
                                     target_price = current.entry_price - next_r * current.risk
+                                    remaining_qty = sum(q for q, _ in scale_out_plan[scale_out_stage:])
                                     remaining_trade = Trade(
                                         day=current.day,
                                         direction=current.direction,
@@ -799,8 +801,8 @@ def run_engine(df_1m: pd.DataFrame, df_30s: pd.DataFrame, allow_counter_candle_e
                                         exit_time=None,
                                         exit_price=None,
                                         pnl=None,
-                                        contracts=next_q,
-                                        risk_dollars=float(current.risk * 2.0 * next_q),
+                                        contracts=remaining_qty,
+                                        risk_dollars=float(current.risk * 2.0 * remaining_qty),
                                         outcome=None,
                                         exit_reason=None,
                                         pivot=current.pivot,

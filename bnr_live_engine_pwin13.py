@@ -818,6 +818,7 @@ class BNRLiveEngine13:
             self._in_trade = False
             self._scale_out_active = False
             self._scale_out_stage = 0
+            self._reset_after_close()
             print(f"[BNR13] EXIT ✓ WIN  target @ {exit_price:.2f} | "
                   f"pnl={pnl_dollars:+.0f}$  daily={self._daily_pnl:+.0f}$")
 
